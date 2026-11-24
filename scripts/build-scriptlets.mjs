@@ -47,8 +47,15 @@ for (const s of builtinScriptlets) {
     if (typeof s.fn !== 'function' || seen.has(s.name)) { continue; }
     seen.add(s.name);
     const src = s.fn.toString();
-    if (!/^function\s+[^\s(){}]+\s*\(/.test(src)) {
-        console.error(`skip ${s.name}: not a named function declaration`);
+    // Scriptlets are invoked by name, so adblock-rust needs `function name(`.
+    // `.fn` helpers are only pasted in as dependencies, so classes and async
+    // functions are fine there.
+    const isHelper = s.name.endsWith('.fn');
+    const ok = isHelper
+        ? /^(async\s+)?function\s*\*?\s*[^\s(){}]+\s*\(|^class\s+[^\s{}]+/.test(src)
+        : /^function\s+[^\s(){}]+\s*\(/.test(src);
+    if (!ok) {
+        console.error(`skip ${s.name}: not a named function/class declaration`);
         continue;
     }
     const r = {

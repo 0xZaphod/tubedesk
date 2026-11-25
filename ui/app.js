@@ -517,6 +517,66 @@ document.addEventListener('keydown', (e) => {
   if (e.key === '/' ) { e.preventDefault(); $('search-input').focus(); }
 });
 
+// ---- like / dislike / add to playlist ---------------------------------------------
+
+let rating = { id: null, value: 'none' };
+function showRating(value) {
+  rating.value = value;
+  $('like').setAttribute('aria-pressed', String(value === 'like'));
+  $('dislike').setAttribute('aria-pressed', String(value === 'dislike'));
+}
+async function loadRating(id) {
+  rating.id = id;
+  showRating('none');
+  if (!id || !state.loggedIn) return;
+  try {
+    const value = await invoke('track_rating', { id });
+    if (rating.id === id) showRating(value);
+  } catch (e) { /* leave neutral */ }
+}
+async function setRating(target) {
+  const id = rating.id;
+  if (!id) return;
+  const before = rating.value;
+  const next = before === target ? 'none' : target; // clicking again removes it
+  showRating(next); // optimistic
+  try {
+    await call('rate_track', { id, rating: next });
+    toast(next === 'like' ? 'Added to Liked music' : next === 'dislike' ? 'Disliked' : 'Rating removed');
+  } catch (e) {
+    if (rating.id === id) showRating(before);
+  }
+}
+$('like').addEventListener('click', () => setRating('like'));
+$('dislike').addEventListener('click', () => setRating('dislike'));
+
+const menu = $('playlist-menu');
+function closeMenu() { menu.hidden = true; }
+$('add-to-playlist').addEventListener('click', async (e) => {
+  e.stopPropagation();
+  if (!menu.hidden) return closeMenu();
+  const track = state.now && state.now.track;
+  if (!track) return;
+  menu.hidden = false;
+  menu.replaceChildren(h('div', { class: 'menu-head', text: 'Add to playlist' }), h('div', { class: 'muted', text: 'Loading…' }));
+  try {
+    const options = await call('playlist_options', { id: track.id });
+    menu.replaceChildren(h('div', { class: 'menu-head', text: 'Add to playlist' }),
+      ...(options.length ? options.map((p) => h('button', {
+        role: 'menuitem', text: p.title,
+        onclick: async () => {
+          closeMenu();
+          const added = await call('add_to_playlist', { playlistId: p.id, videoId: track.id });
+          toast(added ? `Added to ${p.title}` : `Already in ${p.title}`);
+        },
+      })) : [h('div', { class: 'muted', text: 'No playlists of yours found.' })]));
+  } catch (err) {
+    closeMenu();
+  }
+});
+document.addEventListener('click', (e) => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
+
 function applyState(now) {
   const prevId = state.now && state.now.track && state.now.track.id;
   if (!prevId && now.track) showQueue();
@@ -539,6 +599,10 @@ function applyState(now) {
   if (now.error) toast(`Playback failed: ${now.error}`);
   const id = t && t.id;
   if (id !== prevId) {
+    document.querySelector('.np-actions').hidden = !t || !state.loggedIn;
+    $('titlebar-title').textContent = t ? `${t.name} — ${(t.artists || []).map((a) => a.name).join(', ')}` : 'TubeDesk';
+    closeMenu();
+    loadRating(id);
     for (const row of document.querySelectorAll('.track')) row.classList.toggle('current', row.dataset.id === id);
   }
 }
@@ -596,6 +660,9 @@ function applyQueue(q) {
 function applyAuth(a) {
   const changed = state.loggedIn !== a.logged_in;
   state.loggedIn = a.logged_in;
+  const t = state.now && state.now.track;
+  document.querySelector('.np-actions').hidden = !t || !a.logged_in;
+  if (changed && t) loadRating(t.id);
   $('account-nav').querySelector('.label').textContent = a.logged_in ? 'Account' : 'Sign in';
   $('account-nav').title = a.logged_in ? 'Account (signed in)' : 'Sign in';
   if (a.error) toast(a.error);

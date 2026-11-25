@@ -22,6 +22,8 @@ loaded, there are no ads to block.
 - Remembers the queue, the last song and its position; restored paused at start
   and resumed with Play (`~/.local/share/dev.tubedesk.app/session.json`)
 - Play / Shuffle buttons on playlist, album and mix cards; collapsible sidebar
+- **Like / dislike / add to playlist** for the playing song, in the player bar
+  (writes to your YouTube Music account; sign-in required)
 - **Pins**: pin songs, playlists, albums and mixes; they appear first on Home
   (stored locally in `~/.local/share/dev.tubedesk.app/pins.json`)
 - MPRIS media controls (media keys and desktop widgets), tray menu
@@ -53,9 +55,9 @@ Installable bundles: `cargo install tauri-cli --version "^2"` then `cargo tauri 
 
 ## Desktop integration
 
-- Frameless window with its own title bar: the top row drags the window
-  (double-click maximises), with minimise / maximise / close on the right;
-  the window edges resize it.
+- Frameless window with a slim custom title bar (drag to move, double-click
+  to maximise, minimise / maximise / close on the right); the window edges
+  resize it.
 - `./scripts/install-desktop-entry.sh` installs a `.desktop` entry for the
   local build so the taskbar shows the app icon (on Wayland the taskbar takes
   the icon from the desktop file, not from the window).

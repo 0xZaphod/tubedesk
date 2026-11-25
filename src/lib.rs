@@ -1,3 +1,4 @@
+mod account;
 mod auth;
 mod config;
 mod core;
@@ -403,6 +404,28 @@ fn prefetch(app: State<'_, App>, id: String, priority: Option<bool>) {
     app.core.send(CoreMsg::Prefetch { id, priority: priority.unwrap_or(false) });
 }
 
+// ---- account actions -----------------------------------------------------------
+
+#[tauri::command]
+async fn track_rating(app: State<'_, App>, id: String) -> Res<String> {
+    account::rating(&app.rp, &id).await
+}
+
+#[tauri::command]
+async fn rate_track(app: State<'_, App>, id: String, rating: String) -> Res<()> {
+    account::rate(&app.rp, &id, &rating).await
+}
+
+#[tauri::command]
+async fn playlist_options(app: State<'_, App>, id: String) -> Res<Vec<account::PlaylistOption>> {
+    account::playlist_options(&app.rp, &id).await
+}
+
+#[tauri::command]
+async fn add_to_playlist(app: State<'_, App>, playlist_id: String, video_id: String) -> Res<bool> {
+    account::add_to_playlist(&app.rp, &playlist_id, &video_id).await
+}
+
 // ---- pins --------------------------------------------------------------------
 
 fn load_pins(app: &App) -> Vec<home::HomeItem> {
@@ -618,7 +641,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,
-            play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, control, seek, set_volume, sync,
+            play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, track_rating, rate_track, playlist_options, add_to_playlist, control, seek, set_volume, sync,
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)

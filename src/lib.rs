@@ -422,6 +422,11 @@ async fn playlist_options(app: State<'_, App>, id: String) -> Res<Vec<account::P
 }
 
 #[tauri::command]
+async fn remove_from_playlist(app: State<'_, App>, playlist_id: String, video_id: String) -> Res<()> {
+    account::remove_from_playlist(&app.rp, &playlist_id, &video_id).await
+}
+
+#[tauri::command]
 async fn add_to_playlist(app: State<'_, App>, playlist_id: String, video_id: String) -> Res<bool> {
     account::add_to_playlist(&app.rp, &playlist_id, &video_id).await
 }
@@ -641,7 +646,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,
-            play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, track_rating, rate_track, playlist_options, add_to_playlist, control, seek, set_volume, sync,
+            play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, track_rating, rate_track, playlist_options, add_to_playlist, remove_from_playlist, control, seek, set_volume, sync,
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)

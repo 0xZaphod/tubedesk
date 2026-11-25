@@ -71,13 +71,21 @@ pub async fn rate(rp: &RustyPipe, id: &str, rating: &str) -> Result<(), String> 
 pub struct PlaylistOption {
     pub id: String,
     pub title: String,
+    /// The video is already in this playlist.
+    pub contains: bool,
 }
 
-/// The playlists a video can be added to (the website's "Save to playlist"
-/// list), without Liked music, which the Like button covers.
+/// The playlists you can edit, i.e. the "Save to playlist" list, with whether
+/// each already contains the video. Asked as the youtube.com client: only its
+/// answer says which playlists contain the video (YouTube Music's doesn't).
+/// Liked music / Watch later are left out (the Like button covers likes).
 pub async fn playlist_options(rp: &RustyPipe, id: &str) -> Result<Vec<PlaylistOption>, String> {
     let q = signed(rp)?;
-    let resp = call(&q, "playlist/get_add_to_playlist", json!({ "videoIds": [id] })).await?;
+    let text = q
+        .raw(ClientType::Desktop, "playlist/get_add_to_playlist", &json!({ "videoIds": [id] }))
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp: Value = serde_json::from_str(&text).map_err(|e| format!("unexpected response: {e}"))?;
     let mut opts = Vec::new();
     find_all(&resp, "playlistAddToOptionRenderer", &mut opts);
     Ok(opts
@@ -85,9 +93,28 @@ pub async fn playlist_options(rp: &RustyPipe, id: &str) -> Result<Vec<PlaylistOp
         .filter_map(|o| {
             let id = o["playlistId"].as_str()?.to_string();
             let title = o["title"]["runs"][0]["text"].as_str().or(o["title"]["simpleText"].as_str())?.to_string();
-            (id != "LM").then_some(PlaylistOption { id, title })
+            let contains = o["containsSelectedVideos"].as_str() == Some("ALL");
+            (!matches!(id.as_str(), "LM" | "WL")).then_some(PlaylistOption { id, title, contains })
         })
         .collect())
+}
+
+/// Removes a video from one of your playlists.
+pub async fn remove_from_playlist(rp: &RustyPipe, playlist_id: &str, video_id: &str) -> Result<(), String> {
+    let q = signed(rp)?;
+    let resp = call(
+        &q,
+        "browse/edit_playlist",
+        json!({
+            "playlistId": playlist_id,
+            "actions": [{ "action": "ACTION_REMOVE_VIDEO_BY_VIDEO_ID", "removedVideoId": video_id }],
+        }),
+    )
+    .await?;
+    match resp["status"].as_str() {
+        Some("STATUS_SUCCEEDED") => Ok(()),
+        other => Err(format!("YouTube Music answered {}", other.unwrap_or("nothing"))),
+    }
 }
 
 /// Adds a video to a playlist. Returns false if it was already in it.

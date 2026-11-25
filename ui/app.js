@@ -257,7 +257,8 @@ const hoverPrepare = (list) => onHover(`l:${list.kind}:${list.id}`, () => {
   invoke('prepare_list', { kind: list.kind, id: list.id }).catch(() => hinted.delete(`l:${list.kind}:${list.id}`));
 });
 
-function trackList(tracks) {
+// `removeFrom`: id of one of your playlists; rows then get a remove button.
+function trackList(tracks, { removeFrom = null } = {}) {
   if (!tracks.length) return h('div', { class: 'empty', text: 'No tracks.' });
   const playingId = state.now && state.now.track && state.now.track.id;
   return h('ol', { class: 'tracks' }, tracks.map((t, i) => h('li', {
@@ -279,6 +280,15 @@ function trackList(tracks) {
     h('div', { class: 't-dur', text: t.duration ? fmt(t.duration) : '' }),
     h('div', { class: 't-actions' },
       pinButton(trackPinItem(t), 'row'),
+      removeFrom && h('button', {
+        class: 'text', title: 'Remove from this playlist', text: 'Remove',
+        onclick: async (e) => {
+          e.stopPropagation();
+          await call('remove_from_playlist', { playlistId: removeFrom, videoId: t.id });
+          toast(`Removed ${t.name}`);
+          if (state.current && state.current.name === 'playlist') navigate(state.current); // reload the list
+        },
+      }),
       h('button', { class: 'text', title: 'Play next', text: 'Next', onclick: () => { call('enqueue', { tracks: [t], next: true }); toast('Playing next'); } }),
       h('button', { class: 'text', title: 'Add to queue', text: '+ Queue', onclick: () => { call('enqueue', { tracks: [t], next: false }); toast('Added to queue'); } }),
     ),
@@ -449,7 +459,14 @@ async function renderPlaylist(id, fallback = {}) {
   const p = await call('playlist', { id });
   const tracks = p.tracks;
   const thumbs = p.thumbnail.length ? p.thumbnail : (fallback.thumbs || []);
-  return [detailHead(thumbs, p.name || fallback.title || 'Mix', [p.channel && p.channel.name, `${p.track_count || tracks.length} tracks`].filter(Boolean).join(' · ')), playButtons(tracks), trackList(tracks)];
+  // Your own playlists are exactly the ones in the "add to playlist" list.
+  let editable = false;
+  if (state.loggedIn && tracks.length) {
+    const mine = await invoke('playlist_options', { id: tracks[0].id }).catch(() => []);
+    editable = mine.some((o) => o.id === id);
+  }
+  return [detailHead(thumbs, p.name || fallback.title || 'Mix', [p.channel && p.channel.name, `${p.track_count || tracks.length} tracks`].filter(Boolean).join(' · ')),
+    playButtons(tracks), trackList(tracks, { removeFrom: editable ? id : null })];
 }
 
 async function renderAlbum(id) {
@@ -587,13 +604,22 @@ $('add-to-playlist').addEventListener('click', async (e) => {
   }
   menu.replaceChildren(h('div', { class: 'menu-head', text: 'Add to playlist' }),
     ...list.map((p) => h('button', {
-      role: 'menuitem', text: p.title,
+      role: 'menuitemcheckbox', 'aria-checked': String(p.contains),
+      class: p.contains ? 'in-playlist' : '',
+      title: p.contains ? `Remove from ${p.title}` : `Add to ${p.title}`,
       onclick: async () => {
         closeMenu();
-        const added = await call('add_to_playlist', { playlistId: p.id, videoId: track.id });
-        toast(added ? `Added to ${p.title}` : `Already in ${p.title}`);
+        options.promise = null; // contents change: reload next time
+        if (p.contains) {
+          await call('remove_from_playlist', { playlistId: p.id, videoId: track.id });
+          toast(`Removed from ${p.title}`);
+        } else {
+          const added = await call('add_to_playlist', { playlistId: p.id, videoId: track.id });
+          toast(added ? `Added to ${p.title}` : `Already in ${p.title}`);
+        }
+        loadOptions(track.id).catch(() => {});
       },
-    })));
+    }, h('span', { class: 'check', text: p.contains ? '✓' : '' }), h('span', { text: p.title }))));
   menu.hidden = false;
 });
 document.addEventListener('click', (e) => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(); });

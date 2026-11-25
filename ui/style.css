@@ -254,7 +254,10 @@ h2 { font-size: 16px; margin: 18px 0 8px; }
 }
 .menu[hidden] { display: none; }
 .menu-head { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 6px 10px 4px; }
-.menu button { display: block; width: 100%; text-align: left; padding: 7px 10px; border-radius: 6px; }
+.menu button { display: flex; gap: 6px; align-items: center; width: 100%; text-align: left; padding: 7px 10px; border-radius: 6px; }
+.menu .check { width: 14px; flex: none; color: var(--accent); font-weight: 700; }
+.menu button.in-playlist { color: var(--accent); font-weight: 600; }
+.menu button.in-playlist:hover::after { content: "Remove"; margin-left: auto; font-size: 11px; color: var(--muted); font-weight: 400; }
 .menu button:hover { background: var(--hover); }
 .menu .muted { padding: 7px 10px; }
 #np-title { font-weight: 600; }

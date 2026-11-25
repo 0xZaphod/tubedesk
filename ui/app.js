@@ -203,14 +203,17 @@ function renderPinned(slot) {
 
 // Hovering a song for a moment prepares its stream in the background, so a
 // click right after usually plays immediately.
-const hinted = new Set();
+// key → time of the last hint; hints are repeated once the Rust side's
+// prepared state may have expired (10 min).
+const hinted = new Map();
+const HINT_TTL = 9 * 60 * 1000;
 let hoverTimer = null;
 function onHover(key, fire) {
   return {
     onmouseenter: () => {
       clearTimeout(hoverTimer);
-      if (hinted.has(key)) return;
-      hoverTimer = setTimeout(() => { hinted.add(key); fire(); }, 350);
+      if (Date.now() - (hinted.get(key) || 0) < HINT_TTL) return;
+      hoverTimer = setTimeout(() => { hinted.set(key, Date.now()); fire(); }, 350);
     },
     onmouseleave: () => clearTimeout(hoverTimer),
   };

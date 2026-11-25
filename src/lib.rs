@@ -337,11 +337,23 @@ async fn prepare_list(app: State<'_, App>, kind: String, id: String) -> Res<()> 
 #[tauri::command]
 async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool) -> Res<()> {
     let key = format!("{kind}:{id}");
-    let cached = app.prepared.lock().unwrap().remove(&key).filter(|p| p.loaded.elapsed() < PREPARED_TTL);
+    let cached = app.prepared.lock().unwrap().get(&key).filter(|p| p.loaded.elapsed() < PREPARED_TTL).cloned();
     let start = match cached {
         Some(s) => s,
         None => list_start(&app.q(), &kind, &id).await?,
     };
+    // Keep the list prepared for the next Play/Shuffle. A used shuffle order
+    // is replaced by a fresh one right away, and its first song prepared, so
+    // the *next* Shuffle is instant too.
+    {
+        let mut next = start.clone();
+        if shuffle {
+            next.shuffled = next.tracks.clone();
+            crate::shuffle(&mut next.shuffled);
+            app.core.send(CoreMsg::Prefetch { id: next.shuffled[0].id.clone(), priority: true });
+        }
+        app.prepared.lock().unwrap().insert(key, next);
+    }
     let first = if shuffle { start.shuffled } else { start.tracks };
     let (anchor, first_len) = (first[0].id.clone(), first.len());
     app.core.send(CoreMsg::PlayTracks { tracks: first, start: 0 });

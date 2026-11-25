@@ -20,8 +20,13 @@ cargo run                                   # RUST_LOG=tubedesk=debug for detail
 ./scripts/install-desktop-entry.sh          # taskbar icon / app menu entry (Wayland)
 ```
 
-Bundles (`.deb`, AppImage): `cargo install tauri-cli --version "^2"`, then
-`cargo tauri build`.
+AppImage (yt-dlp and deno still come from the system):
+
+```sh
+cargo install tauri-cli --version "^2"
+NO_STRIP=true cargo tauri build --bundles appimage   # NO_STRIP: linuxdeploy's strip fails on Arch
+./scripts/install-desktop-entry.sh --appimage        # copies it to ~/.local/bin
+```
 
 ## Sign-in
 

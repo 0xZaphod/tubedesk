@@ -164,7 +164,9 @@ pub async fn resolve(
         "249/worstaudio[acodec=opus]/worstaudio"
     };
     let urls: Vec<String> = ids.iter().map(|id| format!("https://music.youtube.com/watch?v={id}")).collect();
-    let mut child = match Command::new(ytdlp)
+    let mut cmd = Command::new(ytdlp);
+    crate::appimage::host_env(&mut cmd);
+    let mut child = match cmd
         .args(["--quiet", "--no-warnings", "--no-playlist", "-f", format, "-j"])
         .args(&urls)
         .stdout(std::process::Stdio::piped())

@@ -1,3 +1,4 @@
+mod appimage;
 mod account;
 mod auth;
 mod config;
@@ -642,6 +643,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run() {
+    appimage::fix_environment();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("tubedesk=info")).init();
 
     tauri::Builder::default()

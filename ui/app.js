@@ -101,6 +101,7 @@ async function render(route) {
   show(h('div', { class: 'spinner', text: 'Loading…' }));
   try {
     switch (route.name) {
+    case 'home': return show(...(await renderHome()));
     case 'search': return show(...(await renderSearch(route.query)));
     case 'liked': return show(...(await renderLibraryTracks('liked', 'Liked songs')));
     case 'history': return show(...(await renderLibraryTracks('history', 'Recently played')));
@@ -140,7 +141,7 @@ function trackList(tracks) {
     // plays too. Never both, or one double-click on the title would play 3 times.
     ondblclick: (e) => { if (!e.target.closest('.link, button')) call('play', { tracks, start: i }); },
   },
-    img(t.cover),
+    h('button', { class: 'cover', title: 'Play', 'aria-label': `Play ${t.name}`, onclick: () => call('play', { tracks, start: i }) }, img(t.cover)),
     h('div', { class: 'ellipsis' },
       h('div', { class: 't-title ellipsis link', text: t.name, onclick: () => call('play', { tracks, start: i }) }),
       h('div', { class: 'muted ellipsis' }, artistLinks(t.artists)),
@@ -166,9 +167,9 @@ function playButtons(tracks) {
   );
 }
 
-function card(list, title, sub, onclick, round) {
-  return h('button', { class: `card${round ? ' round' : ''}`, onclick },
-    img(list), h('div', { class: 'ellipsis', text: title }), h('div', { class: 'muted ellipsis', text: sub || '' }));
+function card(list, title, sub, onclick, round, playable) {
+  return h('button', { class: `card${round ? ' round' : ''}${playable ? ' playable' : ''}`, onclick },
+    h('div', { class: 'thumb' }, img(list)), h('div', { class: 'ellipsis', text: title }), h('div', { class: 'muted ellipsis', text: sub || '' }));
 }
 const albumCard = (a) => card(a.cover, a.name, [a.year, (a.artists || []).map((x) => x.name).join(', ')].filter(Boolean).join(' · '), () => navigate({ name: 'album', id: a.id }));
 const playlistCard = (p) => card(p.thumbnail, p.name, [p.channel && p.channel.name, p.track_count && `${p.track_count} tracks`].filter(Boolean).join(' · '), () => navigate({ name: 'playlist', id: p.id }));
@@ -185,6 +186,36 @@ function needLogin() {
 }
 
 // ---- views ---------------------------------------------------------------------
+
+function homeCard(item) {
+  switch (item.kind) {
+  case 'playlist': return card(item.thumbnails, item.title, item.subtitle, () => navigate({ name: 'playlist', id: item.id }));
+  case 'album': return card(item.thumbnails, item.title, item.subtitle, () => navigate({ name: 'album', id: item.id }));
+  case 'artist': return card(item.thumbnails, item.title, item.subtitle, () => navigate({ name: 'artist', id: item.id }), true);
+  case 'mix': return card(item.thumbnails, item.title, item.subtitle, () => { toast(`Starting ${item.title}…`); call('play_mix', { id: item.id }); }, false, true);
+  case 'track': return item.track
+    ? card(item.thumbnails, item.title, item.subtitle, () => call('play', { tracks: [item.track], start: 0 }), false, true)
+    : null;
+  default: return null;
+  }
+}
+
+async function renderHome() {
+  const sections = await call('home');
+  if (!sections.length) return [h('div', { class: 'empty', text: 'YouTube Music returned an empty home page.' })];
+  const out = [h('h1', { text: 'Home' })];
+  if (!state.loggedIn) {
+    out.push(h('div', { class: 'muted' }, 'Sign in for your pinned items, mixes and personal recommendations. ',
+      h('span', { class: 'link', text: 'Sign in', onclick: () => navigate({ name: 'account' }) })));
+  }
+  for (const s of sections) {
+    const body = s.layout === 'tracks'
+      ? trackList(s.items.map((i) => i.track).filter(Boolean))
+      : h('div', { class: 'shelf' }, s.items.map(homeCard).filter(Boolean));
+    out.push(h('section', { class: 'home-section' }, h('h2', { text: s.title || 'For you' }), body));
+  }
+  return out;
+}
 
 async function renderSearch(query) {
   if (!query) {
@@ -331,6 +362,6 @@ function applyAuth(a) {
   await listen('queue', (e) => applyQueue(e.payload));
   await listen('auth', (e) => applyAuth(e.payload));
   invoke('sync');
-  navigate({ name: 'search' }, false);
   try { applyAuth(await invoke('auth_status')); } catch (e) { /* offline */ }
+  navigate({ name: 'home' }, false);
 })();

@@ -14,8 +14,9 @@ pub struct Config {
     pub volume: f64,
     /// Expose a native MPRIS / media-key player.
     pub media_controls: bool,
-    /// Closing the window hides it to the tray instead of quitting.
-    pub close_to_tray: bool,
+    /// Closing the window hides it to the tray (music keeps playing) instead
+    /// of quitting. Off by default: the close button quits.
+    pub hide_on_close: bool,
     /// User agent for the Google sign-in window (None = webview default).
     /// Try a desktop Firefox/Safari UA if Google refuses to sign in.
     pub login_user_agent: Option<String>,
@@ -32,7 +33,7 @@ impl Default for Config {
             autoplay_radio: true,
             volume: 0.8,
             media_controls: true,
-            close_to_tray: true,
+            hide_on_close: false,
             login_user_agent: None,
             ytdlp: "yt-dlp".into(),
             path: PathBuf::new(),

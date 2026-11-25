@@ -7,6 +7,8 @@ loaded, there are no ads to block.
 
 ## Features
 
+- **Home**: your personalised YouTube Music home (Listen again, Mixed for you,
+  Quick picks, recommendations, …); mixes play as radios
 - Search songs, albums, artists and playlists; artist, album and playlist pages
 - **Your YouTube Music library**: liked songs, saved playlists, albums,
   artists and history (sign-in required)
@@ -14,8 +16,8 @@ loaded, there are no ads to block.
 - Queue with play next, add to queue and remove. When the queue runs out it
   continues with YouTube Music's radio for the last track.
 - The next track is resolved in advance, so skipping is instant
-- MPRIS media controls (media keys and desktop widgets), tray menu, close to tray
-- Music keeps playing with the window hidden
+- MPRIS media controls (media keys and desktop widgets), tray menu
+- Optional hide-on-close: music keeps playing with the window hidden
 
 ## Requirements (Arch)
 
@@ -67,7 +69,7 @@ The session cookie is stored by rustypipe in
 | `autoplay_radio` | `true` | continue with radio when the queue ends |
 | `volume` | `0.8` | remembered volume |
 | `media_controls` | `true` | MPRIS / media keys |
-| `close_to_tray` | `true` | close button hides the window |
+| `hide_on_close` | `false` | close button hides the window instead of quitting |
 | `login_user_agent` | `null` | user agent for the Google login window |
 | `ytdlp` | `"yt-dlp"` | yt-dlp executable |
 
@@ -77,6 +79,7 @@ The session cookie is stored by rustypipe in
 ui/                   HTML/CSS/JS frontend (no build step)
 src/lib.rs            Tauri commands, tray, setup
 src/core.rs           queue, playback orchestration, radio, prefetch
+src/home.rs           home feed (FEmusic_home) parser
 src/player.rs         GStreamer playbin thread (audio only)
 src/resolver.rs       yt-dlp → audio stream URL + required headers
 src/proxy.rs          local 127.0.0.1 proxy GStreamer streams from

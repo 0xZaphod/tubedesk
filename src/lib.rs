@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod core;
+mod home;
 mod media;
 mod player;
 mod proxy;
@@ -136,7 +137,24 @@ async fn artist(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicA
     app.rp.query().music_artist(&id, false).await.map_err(err)
 }
 
+#[tauri::command]
+async fn home(app: State<'_, App>) -> Res<Vec<home::HomeSection>> {
+    home::load(&app.rp).await
+}
+
 // ---- playback --------------------------------------------------------------
+
+/// Plays a YouTube Music mix / radio (generated `RD…` playlist).
+#[tauri::command]
+async fn play_mix(app: State<'_, App>, id: String) -> Res<()> {
+    let tracks = app.rp.query().music_radio(&id).await.map_err(err)?.items;
+    if tracks.is_empty() {
+        return Err("this mix is empty".into());
+    }
+    app.core.send(CoreMsg::PlayTracks { tracks, start: 0 });
+    Ok(())
+}
+
 
 #[tauri::command]
 fn play(app: State<'_, App>, tracks: Vec<TrackItem>, start: usize) {
@@ -284,7 +302,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let _ = core_tx.send(core.clone());
 
     let window = app.get_webview_window("main").expect("main window from tauri.conf.json");
-    if config.close_to_tray {
+    if config.hide_on_close {
         let w = window.clone();
         window.on_window_event(move |e| {
             if let WindowEvent::CloseRequested { api, .. } = e {
@@ -317,8 +335,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
-            search, library, playlist, album, artist,
-            play, enqueue, queue_jump, queue_remove, queue_clear, control, seek, set_volume, sync,
+            home, search, library, playlist, album, artist,
+            play, play_mix, enqueue, queue_jump, queue_remove, queue_clear, control, seek, set_volume, sync,
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)

@@ -16,10 +16,15 @@ use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 const LOGIN_LABEL: &str = "login";
-/// Lands on a static page after login so YouTube's web app never runs in the
-/// login window (it would start rotating the cookies we are about to take).
-const DONE_URL: &str = "https://www.youtube.com/robots.txt";
-const LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?service=youtube&passive=true&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3Dhttps%253A%252F%252Fwww.youtube.com%252Frobots.txt";
+/// Google only accepts real YouTube pages as the post-login redirect, so we
+/// land on music.youtube.com and grab the cookies as soon as that page *starts*
+/// loading, before YouTube's scripts run and begin rotating them.
+const LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Ddesktop%26next%3Dhttps%253A%252F%252Fmusic.youtube.com%252F";
+
+/// True once Google has redirected back to a YouTube page (not the signin handler).
+fn is_done(url: &tauri::Url) -> bool {
+    matches!(url.host_str(), Some("music.youtube.com" | "www.youtube.com")) && !url.path().starts_with("/signin")
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthStatus {
@@ -51,15 +56,19 @@ pub fn open_login_window(app: &AppHandle, rp: RustyPipe, user_agent: Option<Stri
         .inner_size(480.0, 720.0)
         .incognito(true)
         .on_page_load(move |webview, payload| {
-            if payload.event() != PageLoadEvent::Finished || !payload.url().as_str().starts_with(DONE_URL) {
+            if payload.event() != PageLoadEvent::Started || !is_done(payload.url()) {
                 return;
             }
+            log::info!("login redirected back to {}", payload.url().host_str().unwrap_or_default());
             let (rp, app) = (rp.clone(), webview.app_handle().clone());
             let window = webview.clone();
             // Cookie access must not happen on the event-loop thread (deadlocks on Windows).
             tauri::async_runtime::spawn(async move {
                 let cookies = window.cookies_for_url("https://www.youtube.com/".parse().unwrap());
                 let _ = window.destroy();
+                if let Ok(c) = &cookies {
+                    log::debug!("login cookies: {}", c.iter().map(|c| c.name()).collect::<Vec<_>>().join(", "));
+                }
                 let result = match cookies {
                     Ok(c) => {
                         let header = c

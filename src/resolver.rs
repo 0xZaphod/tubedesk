@@ -26,6 +26,10 @@ impl Stream {
     pub fn is_fresh(&self) -> bool {
         self.fetched.elapsed() < MAX_AGE
     }
+
+    pub fn age(&self) -> Duration {
+        self.fetched.elapsed()
+    }
 }
 
 #[derive(Deserialize)]

@@ -88,7 +88,7 @@ fn parse_sections(contents: &Value, out: &mut Vec<HomeSection>) {
             }
             "gridRenderer" | "musicGridRenderer" => (text(&r["header"]["gridHeaderRenderer"]["title"]), &r["items"]),
             other => {
-                log::debug!("home: skipping section type {other}");
+                log::trace!("home: skipping section type {other}");
                 continue;
             }
         };
@@ -147,7 +147,7 @@ fn item_from_endpoint(ep: &Value, title: String, subtitle: String, thumbs: Value
             "MUSIC_PAGE_TYPE_ALBUM" | "MUSIC_PAGE_TYPE_AUDIOBOOK" => ("album", id),
             "MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL" => ("artist", id),
             other => {
-                log::debug!("home: skipping browse page type {other}");
+                log::trace!("home: skipping browse page type {other}");
                 return None;
             }
         };

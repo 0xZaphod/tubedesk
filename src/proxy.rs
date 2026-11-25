@@ -22,7 +22,7 @@ const CHUNK: u64 = 1 << 20; // 1 MiB per upstream request
 const RETRIES: u32 = 12;
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 /// Streams kept registered (current, prefetched, recently played).
-const MAX_STREAMS: usize = 10;
+const MAX_STREAMS: usize = 24; // at most ~24 MiB of warmed starts
 
 #[derive(Clone)]
 struct Upstream {

@@ -440,9 +440,25 @@ impl Core {
     }
 
     fn cache_stream(&mut self, id: String, stream: Stream) {
+        const MAX: usize = 40;
         self.streams.retain(|_, s| s.is_fresh());
-        if self.streams.len() > 16 {
-            self.streams.clear();
+        // Evict the oldest, but never the current track or the two after it
+        // (hover prefetches would otherwise push them out).
+        let keep: Vec<String> = self
+            .index
+            .map(|i| self.queue.iter().skip(i).take(3).map(|t| t.id.clone()).collect())
+            .unwrap_or_default();
+        while self.streams.len() >= MAX {
+            let oldest = self
+                .streams
+                .iter()
+                .filter(|(k, _)| !keep.contains(k))
+                .max_by_key(|(_, s)| s.age())
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => self.streams.remove(&k),
+                None => break,
+            };
         }
         self.streams.insert(id, stream);
     }
@@ -456,8 +472,13 @@ impl Core {
     /// Resolves the track at `i` in the background so skipping to it is instant.
     fn prefetch(&mut self, i: usize) {
         let Some(id) = self.queue.get(i).map(|t| t.id.clone()) else { return };
-        if !self.streams.get(&id).is_some_and(|s| s.is_fresh()) {
-            self.request(&id);
+        match self.streams.get(&id).filter(|s| s.is_fresh()) {
+            // Already prepared: re-register so the proxy keeps its warmed start
+            // (its eviction is oldest-registered-first).
+            Some(s) => {
+                self.proxy.register(&id, s);
+            }
+            None => self.request(&id),
         }
     }
 

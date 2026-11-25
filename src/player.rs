@@ -17,6 +17,8 @@ fn gain(slider: f64) -> f64 {
 
 pub enum PlayerCmd {
     Load(String),
+    /// Load and start at a position: preroll paused, seek, then play.
+    LoadAt(String, f64),
     Play,
     Pause,
     Toggle,
@@ -92,6 +94,8 @@ fn run(
     // position; report the seek target instead so the UI doesn't jump to 0.
     let mut seek_target: Option<(f64, std::time::Instant)> = None;
     let mut last_pos = 0.0;
+    // LoadAt: position to seek to once the pipeline has prerolled (paused).
+    let mut pending_start: Option<f64> = None;
 
     loop {
         // Commands (block briefly so the loop also acts as a ~4 Hz ticker).
@@ -99,8 +103,30 @@ fn run(
             Ok(cmd) => {
                 for cmd in std::iter::once(cmd).chain(rx.try_iter()) {
                     match &cmd {
+                        PlayerCmd::LoadAt(uri, pos) => {
+                            errored = false;
+                            pending_start = Some(*pos);
+                            seek_target = None;
+                            last_pos = *pos;
+                            let _ = playbin.set_state(gst::State::Ready);
+                            playbin.set_property("uri", uri);
+                            want_playing = true;
+                            let _ = playbin.set_state(gst::State::Paused);
+                            continue;
+                        }
+                        // Still prerolling for LoadAt: only decide whether to
+                        // play once the seek is done, never start early.
+                        PlayerCmd::Play | PlayerCmd::Pause | PlayerCmd::Toggle if pending_start.is_some() => {
+                            want_playing = match cmd {
+                                PlayerCmd::Play => true,
+                                PlayerCmd::Pause => false,
+                                _ => !want_playing,
+                            };
+                            continue;
+                        }
                         PlayerCmd::Load(_) | PlayerCmd::Stop => {
                             errored = false;
+                            pending_start = None;
                             seek_target = None;
                             last_pos = 0.0;
                         }
@@ -123,6 +149,16 @@ fn run(
                     let _ = playbin.set_state(gst::State::Ready);
                     on_event(PlayerEvent::Eos);
                 }
+                MessageView::AsyncDone(..) if pending_start.is_some() => {
+                    // Prerolled: seek while still paused, then play.
+                    let pos = pending_start.take().unwrap();
+                    let t = gst::ClockTime::from_nseconds((pos * 1e9) as u64);
+                    let _ = playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, t);
+                    seek_target = Some((pos, std::time::Instant::now()));
+                    if want_playing {
+                        let _ = playbin.set_state(gst::State::Playing);
+                    }
+                }
                 MessageView::Error(_) if errored => {}
                 MessageView::Error(err) => {
                     errored = true;
@@ -140,7 +176,9 @@ fn run(
         let mut position = playbin
             .query_position::<gst::ClockTime>()
             .map_or(last_pos, |t| t.nseconds() as f64 / 1e9);
-        if let Some((target, at)) = seek_target {
+        if let Some(pos) = pending_start {
+            position = pos; // still prerolling for a LoadAt
+        } else if let Some((target, at)) = seek_target {
             if (position - target).abs() < 1.5 || at.elapsed() > Duration::from_secs(3) {
                 seek_target = None; // seek done (or gave up waiting)
             } else {
@@ -151,11 +189,13 @@ fn run(
         let duration = playbin
             .query_duration::<gst::ClockTime>()
             .map_or(0.0, |t| t.nseconds() as f64 / 1e9);
-        let tick = (position, duration, want_playing);
+        // Not "playing" until a LoadAt's seek has been made.
+        let playing = want_playing && pending_start.is_none();
+        let tick = (position, duration, playing);
         if tick.0 != last_tick.0 || tick.1 != last_tick.1 || tick.2 != last_tick.2 {
             last_tick = tick;
-            log::trace!("tick {position:.2}/{duration:.0} playing={want_playing}");
-            on_event(PlayerEvent::Tick { position, duration, playing: want_playing });
+            log::trace!("tick {position:.2}/{duration:.0} playing={playing}");
+            on_event(PlayerEvent::Tick { position, duration, playing });
         }
     }
     let _ = playbin.set_state(gst::State::Null);
@@ -163,6 +203,7 @@ fn run(
 
 fn handle(playbin: &gst::Element, cmd: PlayerCmd, want_playing: &mut bool) {
     match cmd {
+        PlayerCmd::LoadAt(..) => {} // handled in the loop (needs the preroll state)
         PlayerCmd::Load(uri) => {
             let _ = playbin.set_state(gst::State::Ready);
             playbin.set_property("uri", &uri);

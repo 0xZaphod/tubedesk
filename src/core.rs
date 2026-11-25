@@ -363,8 +363,14 @@ impl Core {
     }
 
     fn start_at(&mut self, i: usize) {
+        self.start_at_from(i, None);
+    }
+
+    /// Starts track `i`, optionally from position `from` (resume): the player
+    /// then seeks before it starts playing, so the beginning is never heard.
+    fn start_at_from(&mut self, i: usize, from: Option<f64>) {
         self.restored = false;
-        self.pending_seek = None;
+        self.pending_seek = from;
         let Some(track) = self.queue.get(i).cloned() else { return };
         // Repeated play requests for a track that is still starting up (e.g. a
         // double-click) must not restart it.
@@ -439,9 +445,6 @@ impl Core {
                     log::info!("playback started");
                     self.now.loading = false;
                     self.consecutive_errors = 0;
-                    if let Some(p) = self.pending_seek.take() {
-                        self.player.send(PlayerCmd::Seek(p));
-                    }
                 }
                 // Remember the position every 5 s of playback and on pause.
                 let bucket = if playing { position as u64 / 5 } else { u64::MAX };
@@ -463,7 +466,10 @@ impl Core {
     fn load(&mut self, id: &str, stream: &Stream) {
         self.awaiting = None;
         let uri = self.proxy.register(id, stream);
-        self.player.send(PlayerCmd::Load(uri));
+        self.player.send(match self.pending_seek.take() {
+            Some(pos) => PlayerCmd::LoadAt(uri, pos),
+            None => PlayerCmd::Load(uri),
+        });
     }
 
     fn cache_stream(&mut self, id: String, stream: Stream) {
@@ -613,9 +619,6 @@ impl Core {
     fn resume(&mut self) {
         self.restored = false;
         let (Some(i), pos) = (self.index, self.now.position) else { return };
-        self.start_at(i);
-        if pos > 1.0 {
-            self.pending_seek = Some(pos);
-        }
+        self.start_at_from(i, (pos > 1.0).then_some(pos));
     }
 }

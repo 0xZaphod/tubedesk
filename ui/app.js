@@ -467,7 +467,13 @@ $('next').addEventListener('click', () => call('control', { action: 'next' }));
 $('prev').addEventListener('click', () => call('control', { action: 'previous' }));
 const seek = $('seek');
 seek.addEventListener('input', () => { state.seeking = true; $('pos').textContent = fmt(seek.value); });
-seek.addEventListener('change', () => { state.seeking = false; call('seek', { position: Number(seek.value) }); });
+seek.addEventListener('change', () => {
+  state.seeking = false;
+  // Hold the clicked position until the player reports it, so position
+  // updates sent before the seek don't pull the bar back for a moment.
+  state.seekHold = { target: Number(seek.value), until: Date.now() + 2000 };
+  call('seek', { position: Number(seek.value) });
+});
 const vol = $('volume');
 vol.addEventListener('input', () => call('set_volume', { volume: Number(vol.value), persist: false }));
 vol.addEventListener('change', () => call('set_volume', { volume: Number(vol.value), persist: true }));
@@ -489,7 +495,9 @@ function applyState(now) {
   const cover = t && thumb(t.cover);
   if (cover) $('np-cover').src = cover; else $('np-cover').removeAttribute('src');
   $('toggle').textContent = now.loading ? '…' : (now.playing ? '⏸' : '▶');
-  if (!state.seeking) {
+  const hold = state.seekHold;
+  if (hold && (Date.now() > hold.until || Math.abs(now.position - hold.target) < 2)) state.seekHold = null;
+  if (!state.seeking && !state.seekHold) {
     seek.max = Math.max(1, Math.floor(now.duration));
     seek.value = Math.floor(now.position);
     $('pos').textContent = fmt(now.position);

@@ -7,24 +7,28 @@
 
 use rustypipe::client::{ClientType, RustyPipe};
 use rustypipe::model::TrackItem;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Pages of the home feed to load (YouTube serves ~3–6 sections per page).
-const MAX_PAGES: usize = 4;
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HomeSection {
     pub title: String,
     /// "tracks" (song list) or "cards" (playlists, albums, mixes, ...)
-    pub layout: &'static str,
+    pub layout: String,
     pub items: Vec<HomeItem>,
 }
 
+/// One page of the home feed plus the token for the next page.
 #[derive(Debug, Serialize)]
+pub struct HomePage {
+    pub sections: Vec<HomeSection>,
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HomeItem {
     /// track | playlist | album | artist | mix
-    pub kind: &'static str,
+    pub kind: String,
     pub id: String,
     pub title: String,
     pub subtitle: String,
@@ -33,40 +37,30 @@ pub struct HomeItem {
     pub track: Option<TrackItem>,
 }
 
-pub async fn load(rp: &RustyPipe) -> Result<Vec<HomeSection>, String> {
+/// Loads one page: the first one when `token` is None, else the continuation.
+/// The UI renders each page as it arrives instead of waiting for all of them.
+pub async fn load_page(rp: &RustyPipe, token: Option<String>) -> Result<HomePage, String> {
     // Raw requests are only signed when asked; use the account if there is one.
     let q = rp.query();
     let q = if q.auth_enabled(ClientType::DesktopMusic) { q.authenticated() } else { q };
+    let body = match &token {
+        None => json!({ "browseId": "FEmusic_home" }),
+        Some(t) => json!({ "continuation": t }),
+    };
+    let page: Value = serde_json::from_str(&q.raw(ClientType::DesktopMusic, "browse", &body).await.map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let list = if token.is_none() {
+        &page["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]
+    } else {
+        &page["continuationContents"]["sectionListContinuation"]
+    };
     let mut sections = Vec::new();
-    let first: Value = serde_json::from_str(
-        &q.raw(ClientType::DesktopMusic, "browse", &json!({ "browseId": "FEmusic_home" }))
-            .await
-            .map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    let list = &first["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"];
     parse_sections(&list["contents"], &mut sections);
-    let mut token = continuation(list);
-
-    for _ in 1..MAX_PAGES {
-        let Some(t) = token.take() else { break };
-        let page: Value = match q.raw(ClientType::DesktopMusic, "browse", &json!({ "continuation": t })).await {
-            Ok(txt) => serde_json::from_str(&txt).map_err(|e| e.to_string())?,
-            Err(e) => {
-                log::warn!("home continuation failed: {e}");
-                break;
-            }
-        };
-        let cont = &page["continuationContents"]["sectionListContinuation"];
-        parse_sections(&cont["contents"], &mut sections);
-        token = continuation(cont);
-    }
     log::debug!(
-        "home: {}",
+        "home page: {}",
         sections.iter().map(|s| format!("{} ({})", s.title, s.items.len())).collect::<Vec<_>>().join(", ")
     );
-    Ok(sections)
+    Ok(HomePage { sections, next: continuation(list) })
 }
 
 fn continuation(list: &Value) -> Option<String> {
@@ -103,7 +97,7 @@ fn parse_sections(contents: &Value, out: &mut Vec<HomeSection>) {
             continue;
         }
         let layout = if items.iter().all(|i| i.kind == "track") && items.len() > 4 { "tracks" } else { "cards" };
-        out.push(HomeSection { title, layout, items });
+        out.push(HomeSection { title, layout: layout.into(), items });
     }
 }
 
@@ -157,17 +151,20 @@ fn item_from_endpoint(ep: &Value, title: String, subtitle: String, thumbs: Value
                 return None;
             }
         };
-        return Some(HomeItem { kind, id: id.to_string(), title, subtitle, thumbnails: thumbs, track: None });
+        return Some(HomeItem { kind: kind.into(), id: id.to_string(), title, subtitle, thumbnails: thumbs, track: None });
     }
     let watch = ep.get("watchEndpoint").or_else(|| ep.get("watchPlaylistEndpoint"))?;
     let playlist = watch["playlistId"].as_str();
     match (watch["videoId"].as_str(), playlist) {
-        // Mixes / radios are generated playlists (RD…), played as a radio.
-        (_, Some(pl)) if pl.starts_with("RD") => {
-            Some(HomeItem { kind: "mix", id: pl.to_string(), title, subtitle, thumbnails: thumbs, track: None })
-        }
+        // A video id means "play this song" — even when it comes with a radio
+        // playlist (RDAMVM…) that would merely continue after it. Playing that
+        // radio instead would start with some other song.
         (Some(vid), _) => Some(track_item(vid, title, subtitle, thumbs, &runs)),
-        (None, Some(pl)) => Some(HomeItem { kind: "playlist", id: pl.to_string(), title, subtitle, thumbnails: thumbs, track: None }),
+        // Mixes / radios without a seed song are generated playlists (RD…).
+        (None, Some(pl)) if pl.starts_with("RD") => {
+            Some(HomeItem { kind: "mix".into(), id: pl.to_string(), title, subtitle, thumbnails: thumbs, track: None })
+        }
+        (None, Some(pl)) => Some(HomeItem { kind: "playlist".into(), id: pl.to_string(), title, subtitle, thumbnails: thumbs, track: None }),
         (None, None) => None,
     }
 }
@@ -211,5 +208,5 @@ fn track_item(id: &str, title: String, subtitle: String, thumbs: Value, runs: &[
     }))
     .map_err(|e| log::debug!("home: could not build track {id}: {e}"))
     .ok();
-    HomeItem { kind: "track", id: id.to_string(), title, subtitle, thumbnails: thumbs, track }
+    HomeItem { kind: "track".into(), id: id.to_string(), title, subtitle, thumbnails: thumbs, track }
 }

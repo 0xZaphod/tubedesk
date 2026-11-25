@@ -36,13 +36,9 @@ pub fn emit(app: &AppHandle, logged_in: bool, error: Option<String>) {
     let _ = app.emit("auth", AuthStatus { logged_in, error });
 }
 
-pub async fn status(rp: &RustyPipe) -> AuthStatus {
-    match rp.user_auth_check_cookie().await {
-        Ok(()) => AuthStatus { logged_in: true, error: None },
-        Err(rustypipe::error::Error::Auth(_)) => AuthStatus { logged_in: false, error: None },
-        // Network errors etc.: assume the stored cookie is still fine.
-        Err(e) => AuthStatus { logged_in: rp.user_auth_cookie_present(), error: Some(e.to_string()) },
-    }
+/// Whether a YouTube session cookie is stored (no network request).
+pub fn has_session(rp: &RustyPipe) -> bool {
+    rp.query().auth_enabled(rustypipe::client::ClientType::DesktopMusic)
 }
 
 pub fn open_login_window(app: &AppHandle, rp: RustyPipe, user_agent: Option<String>) -> tauri::Result<()> {
@@ -109,14 +105,4 @@ pub async fn import_cookies_txt(rp: &RustyPipe, text: &str) -> Result<(), String
 
 pub async fn logout(rp: &RustyPipe) {
     let _ = rp.user_auth_remove_cookie().await;
-}
-
-trait CookiePresent {
-    fn user_auth_cookie_present(&self) -> bool;
-}
-
-impl CookiePresent for RustyPipe {
-    fn user_auth_cookie_present(&self) -> bool {
-        self.query().auth_enabled(rustypipe::client::ClientType::DesktopMusic)
-    }
 }

@@ -16,6 +16,9 @@ loaded, there are no ads to block.
 - Queue with play next, add to queue and remove. When the queue runs out it
   continues with YouTube Music's radio for the last track.
 - The next track is resolved in advance, so skipping is instant
+- Remembers the queue, the last song and its position; restored paused at start
+  and resumed with Play (`~/.local/share/dev.tubedesk.app/session.json`)
+- Play / Shuffle buttons on playlist, album and mix cards; collapsible sidebar
 - MPRIS media controls (media keys and desktop widgets), tray menu
 - Optional hide-on-close: music keeps playing with the window hidden
 

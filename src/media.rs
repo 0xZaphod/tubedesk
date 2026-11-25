@@ -47,6 +47,7 @@ pub fn spawn(app: AppHandle, core: std::sync::mpsc::Receiver<CoreHandle>) -> Opt
                 }
             };
             let attached = controls.attach(move |event| {
+                log::debug!("media control event: {event:?}");
                 let c = |ctl| core.send(CoreMsg::Control(ctl));
                 match event {
                     MediaControlEvent::Play => c(Control::Play),

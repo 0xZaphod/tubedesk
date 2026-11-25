@@ -76,6 +76,16 @@ pub struct CoreConfig {
     pub autoplay_radio: bool,
     pub high_quality: bool,
     pub ytdlp: String,
+    /// Where the queue, current track and position are remembered.
+    pub session_path: std::path::PathBuf,
+}
+
+/// The last session, restored (paused) at start-up.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Session {
+    tracks: Vec<TrackItem>,
+    index: Option<usize>,
+    position: f64,
 }
 
 struct Core {
@@ -93,6 +103,12 @@ struct Core {
     awaiting: Option<String>,
     /// Ids with a yt-dlp lookup in flight, so each id is resolved at most once at a time.
     inflight: std::collections::HashSet<String>,
+    /// Restored from the last session but not loaded yet: Play resumes it.
+    restored: bool,
+    /// Seek here once the (resumed) track starts playing.
+    pending_seek: Option<f64>,
+    /// Position bucket of the last session save (saves every few seconds).
+    saved_at: Option<u64>,
     consecutive_errors: u32,
     radio_requested_for: Option<String>,
     /// Resolved stream URLs by video id (current + prefetched next track).
@@ -123,10 +139,15 @@ pub fn spawn(
         index: None,
         awaiting: None,
         inflight: Default::default(),
+        restored: false,
+        pending_seek: None,
+        saved_at: None,
         consecutive_errors: 0,
         radio_requested_for: None,
         streams: HashMap::new(),
     };
+    let mut core = core;
+    core.restore();
     tauri::async_runtime::spawn(core.run(rx));
     Ok(me)
 }
@@ -256,6 +277,7 @@ impl Core {
 
     fn control(&mut self, c: Control) {
         match c {
+            Control::Play | Control::Toggle if self.restored => self.resume(),
             Control::Play if self.index.is_none() && !self.queue.is_empty() => self.start_at(0),
             Control::Play => self.player.send(PlayerCmd::Play),
             Control::Pause => self.player.send(PlayerCmd::Pause),
@@ -289,6 +311,8 @@ impl Core {
     }
 
     fn start_at(&mut self, i: usize) {
+        self.restored = false;
+        self.pending_seek = None;
         let Some(track) = self.queue.get(i).cloned() else { return };
         // Repeated play requests for a track that is still starting up (e.g. a
         // double-click) must not restart it.
@@ -325,7 +349,7 @@ impl Core {
             self.radio_requested_for = Some(track.id.clone());
             let (rp, me) = (self.rp.clone(), self.me.clone());
             tauri::async_runtime::spawn(async move {
-                match rp.query().music_radio_track(&track.id).await {
+                match crate::signed_query(&rp).music_radio_track(&track.id).await {
                     Ok(p) => me.send(CoreMsg::RadioLoaded { for_id: track.id, tracks: p.items }),
                     Err(e) => log::warn!("radio for {} failed: {e}", track.id),
                 }
@@ -354,13 +378,25 @@ impl Core {
             }
             PlayerEvent::Error(e) => self.failed(e),
             PlayerEvent::Tick { position, duration, playing } => {
-                if self.index.is_none() {
+                // While showing a restored (not yet loaded) track, the idle
+                // player's ticks would reset the remembered position.
+                if self.index.is_none() || self.restored {
                     return;
                 }
                 if playing && position > 0.0 && self.now.loading {
                     log::info!("playback started");
                     self.now.loading = false;
                     self.consecutive_errors = 0;
+                    if let Some(p) = self.pending_seek.take() {
+                        self.player.send(PlayerCmd::Seek(p));
+                    }
+                }
+                // Remember the position every 5 s of playback and on pause.
+                let bucket = if playing { position as u64 / 5 } else { u64::MAX };
+                if self.saved_at != Some(bucket) && !self.now.loading {
+                    self.saved_at = Some(bucket);
+                    self.now.position = position;
+                    self.save_session();
                 }
                 self.now.position = position;
                 if duration > 0.0 {
@@ -425,5 +461,53 @@ impl Core {
 
     fn emit_queue(&self) {
         let _ = self.app.emit("queue", QueueView { tracks: &self.queue, index: self.index });
+        self.save_session();
+    }
+
+    fn save_session(&self) {
+        let s = Session { tracks: self.queue.clone(), index: self.index, position: self.now.position };
+        match serde_json::to_vec(&s) {
+            Ok(b) => {
+                if let Err(e) = std::fs::write(&self.cfg.session_path, b) {
+                    log::debug!("could not save session: {e}");
+                }
+            }
+            Err(e) => log::debug!("could not serialize session: {e}"),
+        }
+    }
+
+    /// Shows the last session's track (paused) without loading any audio yet.
+    fn restore(&mut self) {
+        let Some(s) = std::fs::read(&self.cfg.session_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Session>(&b).ok())
+        else {
+            return;
+        };
+        let Some(i) = s.index.filter(|&i| i < s.tracks.len()) else { return };
+        let track = s.tracks[i].clone();
+        log::info!("restored last session: {} ({:.0}s)", track.name, s.position);
+        self.queue = s.tracks;
+        self.index = Some(i);
+        self.restored = true;
+        self.now = NowPlaying {
+            duration: track.duration.unwrap_or(0) as f64,
+            track: Some(track),
+            index: Some(i),
+            position: s.position,
+            volume: self.now.volume,
+            ..Default::default()
+        };
+        // The UI isn't listening yet; it asks via Sync once loaded.
+    }
+
+    /// Starts the restored track from where it was left.
+    fn resume(&mut self) {
+        self.restored = false;
+        let (Some(i), pos) = (self.index, self.now.position) else { return };
+        self.start_at(i);
+        if pos > 1.0 {
+            self.pending_seek = Some(pos);
+        }
     }
 }

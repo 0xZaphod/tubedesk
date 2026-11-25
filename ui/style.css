@@ -63,6 +63,8 @@ img { display: block; }
 .nav.active { background: var(--panel-2); font-weight: 600; }
 .nav-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 14px 10px 4px; }
 .spacer { flex: 1; }
+#app.sidebar-collapsed { grid-template-columns: 0 1fr auto; }
+#app.sidebar-collapsed #sidebar { visibility: hidden; padding: 0; border: 0; overflow: hidden; }
 
 /* main */
 #main { grid-area: main; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -115,7 +117,8 @@ h2 { font-size: 16px; margin: 18px 0 8px; }
 
 /* card grid */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
-.card { text-align: left; padding: 8px; border-radius: 8px; min-width: 0; }
+.card { text-align: left; padding: 8px; border-radius: 8px; min-width: 0; cursor: pointer; }
+.card:focus-visible { outline: 2px solid var(--accent); }
 .card:hover { background: var(--hover); }
 .card img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; background: var(--panel-2); margin-bottom: 6px; }
 .card.round img { border-radius: 50%; }
@@ -126,6 +129,18 @@ h2 { font-size: 16px; margin: 18px 0 8px; }
   background: var(--accent); color: var(--accent-text); opacity: 0; transition: opacity .12s;
 }
 .card.playable:hover .thumb::after { opacity: 1; }
+.card-actions {
+  position: absolute; right: 8px; bottom: 14px; display: flex; gap: 6px;
+  opacity: 0; transition: opacity .12s;
+}
+.card:hover .card-actions, .card:focus-within .card-actions { opacity: 1; }
+.card-btn {
+  width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--accent); color: var(--accent-text); font-size: 14px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.card-btn + .card-btn { background: var(--panel); color: var(--text); }
+.card-btn:hover { transform: scale(1.06); }
 .shelf { display: grid; grid-auto-flow: column; grid-auto-columns: 160px; gap: 12px; overflow-x: auto; padding-bottom: 6px; }
 .home-section h2 { margin-top: 22px; }
 
@@ -183,6 +198,7 @@ input[type=range] { accent-color: var(--accent); }
 
 @media (max-width: 760px) {
   #app { grid-template-columns: 150px 1fr; grid-template-areas: "side main" "bar bar"; }
+  #app.sidebar-collapsed { grid-template-columns: 0 1fr; }
   #queue { display: none; }
   #playerbar { grid-template-columns: minmax(0, 1fr) auto; }
   .extras { display: none; }

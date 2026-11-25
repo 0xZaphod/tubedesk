@@ -25,6 +25,54 @@ struct App {
     rp: RustyPipe,
     core: CoreHandle,
     config: Mutex<Config>,
+    /// Home sections loaded since the last first-page load; saved to disk so
+    /// the next start can show them instantly.
+    home: Mutex<Vec<home::HomeSection>>,
+    home_cache_path: std::path::PathBuf,
+}
+
+impl App {
+    /// A query that carries the account session when signed in, so personal
+    /// content (mixes, private playlists, personalised results) works.
+    fn q(&self) -> rustypipe::client::RustyPipeQuery {
+        signed_query(&self.rp)
+    }
+}
+
+pub fn signed_query(rp: &RustyPipe) -> rustypipe::client::RustyPipeQuery {
+    let q = rp.query();
+    if auth::has_session(rp) { q.authenticated() } else { q }
+}
+
+/// Tracks of a playlist. Personal mixes (`RDTMAK…`) are not readable as
+/// playlists, only as radios, so `RD…` ids fall back to the radio endpoint.
+async fn playlist_tracks(q: &rustypipe::client::RustyPipeQuery, id: &str) -> Res<(Option<rustypipe::model::MusicPlaylist>, Vec<TrackItem>)> {
+    match q.music_playlist(id).await {
+        Ok(mut p) => {
+            p.tracks.extend_limit(q, LIST_LIMIT).await.map_err(err)?;
+            let tracks = std::mem::take(&mut p.tracks.items);
+            Ok((Some(p), tracks))
+        }
+        Err(e) if id.starts_with("RD") => {
+            log::debug!("{id} is not readable as a playlist ({e}); loading it as a radio");
+            Ok((None, q.music_radio(id).await.map_err(err)?.items))
+        }
+        Err(e) => Err(err(e)),
+    }
+}
+
+/// Fisher–Yates shuffle with a time-seeded xorshift (no need for a crypto RNG).
+fn shuffle<T>(items: &mut [T]) {
+    let mut x = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x9e3779b97f4a7c15, |d| d.as_nanos() as u64)
+        | 1;
+    for i in (1..items.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        items.swap(i, (x % (i as u64 + 1)) as usize);
+    }
 }
 
 type Res<T> = Result<T, String>;
@@ -70,7 +118,7 @@ struct SearchResults {
 
 #[tauri::command]
 async fn search(app: State<'_, App>, query: String) -> Res<SearchResults> {
-    let q = app.rp.query();
+    let q = app.q();
     let (tracks, albums, artists, playlists) = tokio::join!(
         q.music_search_tracks(&query),
         q.music_search_albums(&query),
@@ -119,42 +167,89 @@ async fn library(app: State<'_, App>, kind: String) -> Res<serde_json::Value> {
     v.map_err(err)
 }
 
+/// Playlist page data. For mixes read as radios there is no playlist header,
+/// so name/thumbnail are null and the UI uses what the card showed.
 #[tauri::command]
-async fn playlist(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicPlaylist> {
-    let q = app.rp.query();
-    let mut p = q.music_playlist(&id).await.map_err(err)?;
-    p.tracks.extend_limit(&q, LIST_LIMIT).await.map_err(err)?;
-    Ok(p)
+async fn playlist(app: State<'_, App>, id: String) -> Res<serde_json::Value> {
+    let (meta, tracks) = playlist_tracks(&app.q(), &id).await?;
+    Ok(serde_json::json!({
+        "id": id,
+        "name": meta.as_ref().map(|p| p.name.clone()),
+        "thumbnail": meta.as_ref().map(|p| p.thumbnail.clone()).unwrap_or_default(),
+        "channel": meta.as_ref().and_then(|p| p.channel.clone()),
+        "track_count": meta.as_ref().and_then(|p| p.track_count).unwrap_or(tracks.len() as u64),
+        "tracks": tracks,
+    }))
 }
 
 #[tauri::command]
 async fn album(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicAlbum> {
-    app.rp.query().music_album(&id).await.map_err(err)
+    app.q().music_album(&id).await.map_err(err)
 }
 
 #[tauri::command]
 async fn artist(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicArtist> {
-    app.rp.query().music_artist(&id, false).await.map_err(err)
+    app.q().music_artist(&id, false).await.map_err(err)
 }
 
+/// The home page as it was last loaded (instant, possibly stale).
 #[tauri::command]
-async fn home(app: State<'_, App>) -> Res<Vec<home::HomeSection>> {
-    home::load(&app.rp).await
+fn home_cached(app: State<'_, App>) -> Vec<home::HomeSection> {
+    std::fs::read(&app.home_cache_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// One page of the live home feed; `token` = None starts over.
+#[tauri::command]
+async fn home_page(app: State<'_, App>, token: Option<String>) -> Res<home::HomePage> {
+    let first = token.is_none();
+    let page = home::load_page(&app.rp, token).await?;
+    let mut all = app.home.lock().unwrap();
+    if first {
+        all.clear();
+    }
+    all.extend(page.sections.iter().cloned());
+    if let Ok(json) = serde_json::to_vec(&*all) {
+        let _ = std::fs::write(&app.home_cache_path, json);
+    }
+    Ok(page)
 }
 
 // ---- playback --------------------------------------------------------------
 
-/// Plays a YouTube Music mix / radio (generated `RD…` playlist).
+/// Plays (optionally shuffled) a whole playlist, album or mix by id.
 #[tauri::command]
-async fn play_mix(app: State<'_, App>, id: String) -> Res<()> {
-    let tracks = app.rp.query().music_radio(&id).await.map_err(err)?.items;
+async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool) -> Res<()> {
+    let q = app.q();
+    let mut tracks = match kind.as_str() {
+        "playlist" => playlist_tracks(&q, &id).await?.1,
+        "album" => {
+            let a = q.music_album(&id).await.map_err(err)?;
+            let cover = a.cover.clone();
+            a.tracks
+                .into_iter()
+                .map(|mut t| {
+                    if t.cover.is_empty() {
+                        t.cover = cover.clone();
+                    }
+                    t
+                })
+                .collect()
+        }
+        "mix" => q.music_radio(&id).await.map_err(err)?.items,
+        other => return Err(format!("can't play a {other}")),
+    };
     if tracks.is_empty() {
-        return Err("this mix is empty".into());
+        return Err("nothing to play".into());
+    }
+    if shuffle {
+        crate::shuffle(&mut tracks);
     }
     app.core.send(CoreMsg::PlayTracks { tracks, start: 0 });
     Ok(())
 }
-
 
 #[tauri::command]
 fn play(app: State<'_, App>, tracks: Vec<TrackItem>, start: usize) {
@@ -214,9 +309,11 @@ fn sync(app: State<'_, App>) {
 
 // ---- account ---------------------------------------------------------------
 
+/// Local check only (is a session stored?). Verifying it online took a whole
+/// request at every start; an expired session shows up as library errors.
 #[tauri::command]
-async fn auth_status(app: State<'_, App>) -> Res<auth::AuthStatus> {
-    Ok(auth::status(&app.rp).await)
+fn auth_status(app: State<'_, App>) -> auth::AuthStatus {
+    auth::AuthStatus { logged_in: auth::has_session(&app.rp), error: None }
 }
 
 #[tauri::command]
@@ -302,6 +399,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             autoplay_radio: config.autoplay_radio,
             high_quality: config.high_quality,
             ytdlp: config.ytdlp.clone(),
+            session_path: data_dir.join("session.json"),
         },
     )?;
     let _ = core_tx.send(core.clone());
@@ -330,7 +428,13 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     build_tray(&handle, core.clone())?;
-    app.manage(App { rp, core, config: Mutex::new(config) });
+    app.manage(App {
+        rp,
+        core,
+        config: Mutex::new(config),
+        home: Mutex::default(),
+        home_cache_path: data_dir.join("home_cache.json"),
+    });
     Ok(())
 }
 
@@ -340,8 +444,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
-            home, search, library, playlist, album, artist,
-            play, play_mix, enqueue, queue_jump, queue_remove, queue_move, queue_clear, control, seek, set_volume, sync,
+            home_cached, home_page, search, library, playlist, album, artist,
+            play, play_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, control, seek, set_volume, sync,
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)

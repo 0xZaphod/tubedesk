@@ -51,7 +51,7 @@ function toast(msg) {
 function showQueue() {
   $('queue').hidden = false;
 }
-const PLAY_COMMANDS = new Set(['play', 'play_mix']);
+const PLAY_COMMANDS = new Set(['play', 'play_list']);
 
 async function call(cmd, args) {
   if (PLAY_COMMANDS.has(cmd)) showQueue();
@@ -70,7 +70,6 @@ const state = {
   now: null,
   queue: { tracks: [], index: null },
   seeking: false,
-  history: [],
   current: null,
 };
 
@@ -78,19 +77,22 @@ const state = {
 
 const view = $('view');
 
-function navigate(route, push = true) {
-  if (push && state.current) state.history.push(state.current);
+function navigate(route) {
   state.current = route;
-  $('back').disabled = state.history.length === 0;
   for (const b of document.querySelectorAll('.nav')) {
     b.classList.toggle('active', b.dataset.view === route.name);
   }
   render(route);
 }
-$('back').addEventListener('click', () => {
-  const prev = state.history.pop();
-  if (prev) navigate(prev, false);
-});
+// Sidebar collapse, remembered per device (localStorage may be unavailable).
+function setSidebar(collapsed) {
+  $('app').classList.toggle('sidebar-collapsed', collapsed);
+  $('sidebar-toggle').setAttribute('aria-expanded', String(!collapsed));
+  $('sidebar-toggle').title = collapsed ? 'Show sidebar' : 'Hide sidebar';
+  try { localStorage.setItem('sidebarCollapsed', collapsed ? '1' : '0'); } catch (e) { /* ignore */ }
+}
+$('sidebar-toggle').addEventListener('click', () => setSidebar(!$('app').classList.contains('sidebar-collapsed')));
+try { setSidebar(localStorage.getItem('sidebarCollapsed') === '1'); } catch (e) { setSidebar(false); }
 for (const b of document.querySelectorAll('.nav')) {
   b.addEventListener('click', () => navigate({ name: b.dataset.view }));
 }
@@ -107,14 +109,14 @@ async function render(route) {
   show(h('div', { class: 'spinner', text: 'Loading…' }));
   try {
     switch (route.name) {
-    case 'home': return show(...(await renderHome()));
+    case 'home': return await renderHome(token, show);
     case 'search': return show(...(await renderSearch(route.query)));
     case 'liked': return show(...(await renderLibraryTracks('liked', 'Liked songs')));
     case 'history': return show(...(await renderLibraryTracks('history', 'Recently played')));
     case 'playlists': return show(...(await renderLibraryCards('playlists', 'Playlists', playlistCard)));
     case 'albums': return show(...(await renderLibraryCards('albums', 'Albums', albumCard)));
     case 'artists': return show(...(await renderLibraryCards('artists', 'Artists', artistCard)));
-    case 'playlist': return show(...(await renderPlaylist(route.id)));
+    case 'playlist': return show(...(await renderPlaylist(route.id, route)));
     case 'album': return show(...(await renderAlbum(route.id)));
     case 'artist': return show(...(await renderArtist(route.id)));
     case 'account': return show(...renderAccount());
@@ -165,7 +167,14 @@ function trackList(tracks) {
 
 function playButtons(tracks) {
   if (!tracks.length) return null;
-  const shuffled = () => [...tracks].sort(() => Math.random() - 0.5);
+  const shuffled = () => {
+    const a = [...tracks];
+    for (let i = a.length - 1; i > 0; i--) { // Fisher–Yates
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
   return h('div', { class: 'row-actions' },
     h('button', { class: 'btn', text: 'Play', onclick: () => call('play', { tracks, start: 0 }) }),
     h('button', { class: 'btn secondary', text: 'Shuffle', onclick: () => call('play', { tracks: shuffled(), start: 0 }) }),
@@ -173,13 +182,33 @@ function playButtons(tracks) {
   );
 }
 
-function card(list, title, sub, onclick, round, playable) {
-  return h('button', { class: `card${round ? ' round' : ''}${playable ? ' playable' : ''}`, onclick },
-    h('div', { class: 'thumb' }, img(list)), h('div', { class: 'ellipsis', text: title }), h('div', { class: 'muted ellipsis', text: sub || '' }));
+// A card is a div (not a <button>) so it can contain the Play/Shuffle buttons.
+//   list: { kind, id } → hover Play + Shuffle buttons that play the whole list
+//   playable: show a single ▶ hint (the card itself plays on click)
+function card(thumbs, title, sub, onclick, { round = false, list = null, playable = false } = {}) {
+  const act = (shuffle) => (e) => {
+    e.stopPropagation();
+    toast(shuffle ? `Shuffling ${title}…` : `Playing ${title}…`);
+    call('play_list', { kind: list.kind, id: list.id, shuffle });
+  };
+  return h('div', {
+    class: `card${round ? ' round' : ''}${playable ? ' playable' : ''}`,
+    role: 'button', tabindex: '0', title,
+    onclick,
+    onkeydown: (e) => { if (e.key === 'Enter') onclick(); },
+  },
+    h('div', { class: 'thumb' }, img(thumbs),
+      list && h('div', { class: 'card-actions' },
+        h('button', { class: 'card-btn', title: 'Play', 'aria-label': `Play ${title}`, text: '▶', onclick: act(false) }),
+        h('button', { class: 'card-btn', title: 'Shuffle', 'aria-label': `Shuffle ${title}`, text: '⤮', onclick: act(true) }))),
+    h('div', { class: 'ellipsis', text: title }),
+    h('div', { class: 'muted ellipsis', text: sub || '' }));
 }
-const albumCard = (a) => card(a.cover, a.name, [a.year, (a.artists || []).map((x) => x.name).join(', ')].filter(Boolean).join(' · '), () => navigate({ name: 'album', id: a.id }));
-const playlistCard = (p) => card(p.thumbnail, p.name, [p.channel && p.channel.name, p.track_count && `${p.track_count} tracks`].filter(Boolean).join(' · '), () => navigate({ name: 'playlist', id: p.id }));
-const artistCard = (a) => card(a.avatar, a.name, 'Artist', () => navigate({ name: 'artist', id: a.id }), true);
+const albumCard = (a) => card(a.cover, a.name, [a.year, (a.artists || []).map((x) => x.name).join(', ')].filter(Boolean).join(' · '),
+  () => navigate({ name: 'album', id: a.id }), { list: { kind: 'album', id: a.id } });
+const playlistCard = (p) => card(p.thumbnail, p.name, [p.channel && p.channel.name, p.track_count && `${p.track_count} tracks`].filter(Boolean).join(' · '),
+  () => navigate({ name: 'playlist', id: p.id }), { list: { kind: 'playlist', id: p.id } });
+const artistCard = (a) => card(a.avatar, a.name, 'Artist', () => navigate({ name: 'artist', id: a.id }), { round: true });
 
 function detailHead(thumbs, title, sub) {
   return h('div', { class: 'detail-head' }, img(thumbs), h('div', { class: 'meta' }, h('h1', { text: title }), h('div', { class: 'muted' }, sub)));
@@ -194,33 +223,55 @@ function needLogin() {
 // ---- views ---------------------------------------------------------------------
 
 function homeCard(item) {
+  const { thumbnails: th, title, subtitle: sub, id } = item;
   switch (item.kind) {
-  case 'playlist': return card(item.thumbnails, item.title, item.subtitle, () => navigate({ name: 'playlist', id: item.id }));
-  case 'album': return card(item.thumbnails, item.title, item.subtitle, () => navigate({ name: 'album', id: item.id }));
-  case 'artist': return card(item.thumbnails, item.title, item.subtitle, () => navigate({ name: 'artist', id: item.id }), true);
-  case 'mix': return card(item.thumbnails, item.title, item.subtitle, () => { toast(`Starting ${item.title}…`); call('play_mix', { id: item.id }); }, false, true);
+  case 'playlist': return card(th, title, sub, () => navigate({ name: 'playlist', id, title, thumbs: th }), { list: { kind: 'playlist', id } });
+  case 'album': return card(th, title, sub, () => navigate({ name: 'album', id }), { list: { kind: 'album', id } });
+  case 'artist': return card(th, title, sub, () => navigate({ name: 'artist', id }), { round: true });
+  case 'mix': return card(th, title, sub, () => { toast(`Playing ${title}…`); call('play_list', { kind: 'mix', id, shuffle: false }); },
+    { list: { kind: 'mix', id } });
   case 'track': return item.track
-    ? card(item.thumbnails, item.title, item.subtitle, () => call('play', { tracks: [item.track], start: 0 }), false, true)
+    ? card(th, title, sub, () => call('play', { tracks: [item.track], start: 0 }), { playable: true })
     : null;
   default: return null;
   }
 }
 
-async function renderHome() {
-  const sections = await call('home');
-  if (!sections.length) return [h('div', { class: 'empty', text: 'YouTube Music returned an empty home page.' })];
-  const out = [h('h1', { text: 'Home' })];
+function homeSection(s) {
+  const body = s.layout === 'tracks'
+    ? trackList(s.items.map((i) => i.track).filter(Boolean))
+    : h('div', { class: 'shelf' }, s.items.map(homeCard).filter(Boolean));
+  return h('section', { class: 'home-section' }, h('h2', { text: s.title || 'For you' }), body);
+}
+
+// Home renders progressively: the last saved copy appears instantly, then the
+// live feed replaces it page by page as each page arrives.
+async function renderHome(token, show) {
+  const header = [h('h1', { text: 'Home' })];
   if (!state.loggedIn) {
-    out.push(h('div', { class: 'muted' }, 'Sign in for your pinned items, mixes and personal recommendations. ',
+    header.push(h('div', { class: 'muted' }, 'Sign in for your pinned items, mixes and personal recommendations. ',
       h('span', { class: 'link', text: 'Sign in', onclick: () => navigate({ name: 'account' }) })));
   }
-  for (const s of sections) {
-    const body = s.layout === 'tracks'
-      ? trackList(s.items.map((i) => i.track).filter(Boolean))
-      : h('div', { class: 'shelf' }, s.items.map(homeCard).filter(Boolean));
-    out.push(h('section', { class: 'home-section' }, h('h2', { text: s.title || 'For you' }), body));
+  const stale = () => token !== renderToken;
+
+  const cached = await invoke('home_cached').catch(() => []);
+  if (stale()) return;
+  if (cached.length) show(...header, ...cached.map(homeSection));
+
+  let page = await call('home_page', { token: null });
+  if (stale()) return;
+  const live = h('div');
+  live.append(...page.sections.map(homeSection));
+  show(...header, live);
+  if (!page.sections.length && !page.next) {
+    show(h('div', { class: 'empty', text: 'YouTube Music returned an empty home page.' }));
+    return;
   }
-  return out;
+  for (let i = 0; i < 6 && page.next; i++) {
+    page = await call('home_page', { token: page.next });
+    if (stale()) return;
+    live.append(...page.sections.map(homeSection));
+  }
 }
 
 async function renderSearch(query) {
@@ -250,10 +301,11 @@ async function renderLibraryCards(kind, title, mk) {
   return [h('h1', { text: title }), items.length ? h('div', { class: 'grid' }, items.map(mk)) : h('div', { class: 'empty', text: 'Nothing here yet.' })];
 }
 
-async function renderPlaylist(id) {
+async function renderPlaylist(id, fallback = {}) {
   const p = await call('playlist', { id });
-  const tracks = p.tracks.items;
-  return [detailHead(p.thumbnail, p.name, [p.channel && p.channel.name, `${p.track_count || tracks.length} tracks`].filter(Boolean).join(' · ')), playButtons(tracks), trackList(tracks)];
+  const tracks = p.tracks;
+  const thumbs = p.thumbnail.length ? p.thumbnail : (fallback.thumbs || []);
+  return [detailHead(thumbs, p.name || fallback.title || 'Mix', [p.channel && p.channel.name, `${p.track_count || tracks.length} tracks`].filter(Boolean).join(' · ')), playButtons(tracks), trackList(tracks)];
 }
 
 async function renderAlbum(id) {
@@ -394,7 +446,7 @@ function applyAuth(a) {
   state.loggedIn = a.logged_in;
   $('account-nav').textContent = a.logged_in ? 'Account ✓' : 'Sign in';
   if (a.error) toast(a.error);
-  if (changed && state.current) navigate(state.current, false);
+  if (changed && state.current) navigate(state.current);
 }
 
 // ---- start -----------------------------------------------------------------------
@@ -404,6 +456,6 @@ function applyAuth(a) {
   await listen('queue', (e) => applyQueue(e.payload));
   await listen('auth', (e) => applyAuth(e.payload));
   invoke('sync');
-  try { applyAuth(await invoke('auth_status')); } catch (e) { /* offline */ }
-  navigate({ name: 'home' }, false);
+  try { applyAuth(await invoke('auth_status')); } catch (e) { /* ignore */ }
+  navigate({ name: 'home' });
 })();

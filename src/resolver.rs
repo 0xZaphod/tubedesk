@@ -11,10 +11,24 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-/// Background lookups (prefetches) run at most this many at once: each
-/// yt-dlp run also starts deno to solve YouTube's JS challenges, and a burst
-/// of them slows everything down, including YouTube's warm-up and the UI.
-static BACKGROUND: Semaphore = Semaphore::const_new(2);
+/// Background lookups run on limited lanes: each yt-dlp run also starts deno
+/// to solve YouTube's JS challenges, and a burst of them slows everything
+/// down, including YouTube's warm-up and the UI. Speculative hints (hover)
+/// have their own lane, so they never delay the queue's next tracks.
+static AHEAD: Semaphore = Semaphore::const_new(2);
+static SPECULATIVE: Semaphore = Semaphore::const_new(1);
+/// A speculative hint that waited this long for its slot is no longer worth it.
+const STALE_HINT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// The track the user is waiting for: never queued.
+    Now,
+    /// Upcoming queue tracks and likely picks (a list's first track).
+    Ahead,
+    /// Hover hints.
+    Speculative,
+}
 
 /// Stream URLs expire after ~6 h; don't reuse cached ones near that.
 const MAX_AGE: Duration = Duration::from_secs(4 * 3600);
@@ -70,9 +84,19 @@ pub async fn quick(rp: &rustypipe::client::RustyPipe, id: &str, high_quality: bo
     Ok((s.url.clone(), s.size, s.mime.clone()))
 }
 
-/// `background`: wait for one of the limited background slots first.
-pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool, background: bool) -> Result<Stream, String> {
-    let _permit = if background { Some(BACKGROUND.acquire().await.map_err(|e| e.to_string())?) } else { None };
+pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool, lane: Lane) -> Result<Stream, String> {
+    let queued = Instant::now();
+    let _permit = match lane {
+        Lane::Now => None,
+        Lane::Ahead => Some(AHEAD.acquire().await.map_err(|e| e.to_string())?),
+        Lane::Speculative => {
+            let permit = SPECULATIVE.acquire().await.map_err(|e| e.to_string())?;
+            if queued.elapsed() > STALE_HINT {
+                return Err("hint dropped (waited too long)".into());
+            }
+            Some(permit)
+        }
+    };
     // Prefer the exact itag `quick` uses, so its bytes and ours are the same file.
     let format = if high_quality {
         "251/bestaudio[acodec=opus]/bestaudio"

@@ -325,8 +325,9 @@ async fn prepare_list(app: State<'_, App>, kind: String, id: String) -> Res<()> 
         return Ok(());
     }
     let start = list_start(&app.q(), &kind, &id).await?;
-    app.core.send(CoreMsg::Prefetch { id: start.tracks[0].id.clone(), priority: true });
-    app.core.send(CoreMsg::Prefetch { id: start.shuffled[0].id.clone(), priority: true });
+    // Speculative (a hover or a pinned list): dropped while lookups pile up.
+    app.core.send(CoreMsg::Prefetch { id: start.tracks[0].id.clone(), priority: false });
+    app.core.send(CoreMsg::Prefetch { id: start.shuffled[0].id.clone(), priority: false });
     let mut prepared = app.prepared.lock().unwrap();
     prepared.retain(|_, p| p.loaded.elapsed() < PREPARED_TTL);
     prepared.insert(key, start);
@@ -351,13 +352,13 @@ async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool)
         if shuffle {
             next.shuffled = next.tracks.clone();
             crate::shuffle(&mut next.shuffled);
-            app.core.send(CoreMsg::Prefetch { id: next.shuffled[0].id.clone(), priority: true });
+            app.core.send(CoreMsg::Prefetch { id: next.shuffled[0].id.clone(), priority: false });
         }
         app.prepared.lock().unwrap().insert(key, next);
     }
     let first = if shuffle { start.shuffled } else { start.tracks };
-    let (anchor, first_len) = (first[0].id.clone(), first.len());
-    app.core.send(if shuffle { CoreMsg::PlayShuffled(first) } else { CoreMsg::PlayTracks { tracks: first, start: 0 } });
+    let (token, first_len) = (crate::core::list_token(), first.len());
+    app.core.send(CoreMsg::PlayList { tracks: first, shuffled: shuffle, token });
 
     if let Some((mut pages, query)) = start.rest {
         let core = app.core.clone();
@@ -370,7 +371,7 @@ async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool)
                 crate::shuffle(&mut rest);
             }
             if !rest.is_empty() {
-                core.send(CoreMsg::Extend { anchor, tracks: rest });
+                core.send(CoreMsg::Extend { token, tracks: rest });
             }
         });
     }

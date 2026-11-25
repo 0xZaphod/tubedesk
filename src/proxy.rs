@@ -51,6 +51,8 @@ struct Upstream {
     mime: String,
     /// First bytes of the stream, fetched ahead of time by [`StreamProxy::warm`].
     head: Option<Arc<Vec<u8>>>,
+    /// A `warm` is downloading the head.
+    warming: bool,
 }
 
 #[derive(Default)]
@@ -139,7 +141,7 @@ impl StreamProxy {
             None => {
                 st.map.insert(
                     id.to_string(),
-                    Upstream { full: Some(full), quick: None, size: s.size, mime: s.mime.clone(), head: None },
+                    Upstream { full: Some(full), quick: None, size: s.size, mime: s.mime.clone(), head: None, warming: false },
                 );
             }
         }
@@ -155,34 +157,54 @@ impl StreamProxy {
             Some(u) if u.size == size => u.quick = Some(url),
             Some(_) => log::warn!("{id}: quick stream size differs from the full one; not using it"),
             None => {
-                st.map.insert(id.to_string(), Upstream { full: None, quick: Some(url), size, mime, head: None });
+                st.map.insert(id.to_string(), Upstream { full: None, quick: Some(url), size, mime, head: None, warming: false });
             }
         }
         st.touch(id);
         self.local_url(id)
     }
 
+    /// Forgets a stream (e.g. its full URL could not be resolved), so
+    /// requests waiting for its full URL give up right away.
+    pub fn forget(&self, id: &str) {
+        let mut st = self.streams.lock().unwrap();
+        st.map.remove(id);
+        st.order.retain(|x| x != id);
+    }
+
     /// Fetches and keeps the first chunk of a registered stream so that
-    /// playing it later starts immediately.
+    /// playing it later starts immediately. Does nothing if it is already
+    /// warm or being warmed.
     pub async fn warm(&self, id: &str) {
-        let Some(up) = self.streams.lock().unwrap().map.get(id).cloned() else { return };
-        let Some(full) = up.full.clone() else { return };
-        if up.head.is_some() || up.size == 0 {
-            return;
-        }
-        let end = (CHUNK - 1).min(up.size - 1);
+        let (full, size) = {
+            let mut st = self.streams.lock().unwrap();
+            let Some(u) = st.map.get_mut(id) else { return };
+            let Some(full) = u.full.clone() else { return };
+            if u.head.is_some() || u.warming || u.size == 0 {
+                return;
+            }
+            u.warming = true;
+            (full, u.size)
+        };
+        // A fresh URL is refused at first: wait instead of retrying into 403s.
+        tokio::time::sleep(FULL_WARMUP.saturating_sub(full.registered.elapsed())).await;
+        let end = (CHUNK - 1).min(size - 1);
         let url = format!("{}&range=0-{end}", full.url);
         let bytes = match self.fetch(&full.headers, &url, RETRIES).await {
-            Ok(Some(resp)) => match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => return log::debug!("warming {id} failed: {e}"),
-            },
-            _ => return log::debug!("warming {id} failed"),
+            Ok(Some(resp)) => resp.bytes().await.map_err(|e| e.to_string()),
+            Ok(None) => Err("refused".to_string()),
+            Err(e) => Err(e.to_string()),
         };
         let mut st = self.streams.lock().unwrap();
-        if let Some(u) = st.map.get_mut(id).filter(|u| u.full.as_ref().is_some_and(|f| f.url == full.url)) {
-            log::debug!("warmed {id}: {} bytes ready", bytes.len());
-            u.head = Some(Arc::new(bytes.to_vec()));
+        let Some(u) = st.map.get_mut(id) else { return };
+        u.warming = false;
+        match bytes {
+            Ok(b) if u.full.as_ref().is_some_and(|f| f.url == full.url) => {
+                log::debug!("warmed {id}: {} bytes ready", b.len());
+                u.head = Some(Arc::new(b.to_vec()));
+            }
+            Ok(_) => {} // a different full URL was registered meanwhile
+            Err(e) => log::debug!("warming {id} failed: {e}"),
         }
     }
 
@@ -215,8 +237,13 @@ impl StreamProxy {
     async fn wait_full(&self, id: &str) -> Option<Full> {
         let until = Instant::now() + FULL_WAIT;
         loop {
-            if let Some(f) = self.streams.lock().unwrap().map.get(id).and_then(|u| u.full.clone()) {
-                return Some(f);
+            match self.streams.lock().unwrap().map.get(id) {
+                None => return None, // forgotten
+                Some(u) => {
+                    if let Some(f) = &u.full {
+                        return Some(f.clone());
+                    }
+                }
             }
             if Instant::now() > until {
                 return None;
@@ -343,6 +370,11 @@ impl StreamProxy {
                 log::warn!("{id}: no full stream URL arrived");
                 return Ok(());
             };
+            let warmup = FULL_WARMUP.saturating_sub(full.registered.elapsed());
+            if !warmup.is_zero() {
+                log::debug!("{id}: full URL still warming up; waiting {} ms", warmup.as_millis());
+                tokio::time::sleep(warmup).await;
+            }
             let chunk_end = (pos + CHUNK - 1).min(end);
             let url = format!("{}&range={pos}-{chunk_end}", full.url);
             log::debug!("upstream {id}: bytes {pos}-{chunk_end}");

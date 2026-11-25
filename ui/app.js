@@ -284,9 +284,13 @@ function trackList(tracks, { removeFrom = null } = {}) {
         class: 'text', title: 'Remove from this playlist', text: 'Remove',
         onclick: async (e) => {
           e.stopPropagation();
+          const list = e.currentTarget.closest('ol'); // currentTarget is gone after the await
           await call('remove_from_playlist', { playlistId: removeFrom, videoId: t.id });
           toast(`Removed ${t.name}`);
-          if (state.current && state.current.name === 'playlist') navigate(state.current); // reload the list
+          // Update in place (the array is shared with the Play buttons) instead of reloading.
+          const k = tracks.indexOf(t);
+          if (k >= 0) tracks.splice(k, 1);
+          list.replaceWith(trackList(tracks, { removeFrom }));
         },
       }),
       h('button', { class: 'text', title: 'Play next', text: 'Next', onclick: () => { call('enqueue', { tracks: [t], next: true }); toast('Playing next'); } }),
@@ -309,17 +313,16 @@ function shuffledCopy(tracks) {
 function playButtons(tracks) {
   if (!tracks.length) return null;
   let order = shuffledCopy(tracks);
-  const prepare = () => {
-    invoke('prefetch', { id: tracks[0].id, priority: true });
-    invoke('prefetch', { id: order[0].id, priority: true });
-  };
-  prepare();
+  // The first track is a likely pick; the shuffle pick is only a guess, so
+  // that lookup may be dropped while others are running.
+  invoke('prefetch', { id: tracks[0].id, priority: true });
+  invoke('prefetch', { id: order[0].id, priority: false });
   return h('div', { class: 'row-actions' },
     h('button', { class: 'btn', text: 'Play', onclick: () => call('play', { tracks, start: 0 }) }),
     h('button', { class: 'btn secondary', text: 'Shuffle', onclick: () => {
       call('play', { tracks: order, start: 0 });
       order = shuffledCopy(tracks); // next Shuffle gets a new order, prepared too
-      invoke('prefetch', { id: order[0].id, priority: true });
+      invoke('prefetch', { id: order[0].id, priority: false });
     } }),
     h('button', { class: 'btn secondary', text: 'Add to queue', onclick: () => { call('enqueue', { tracks, next: false }); toast(`Added ${tracks.length} tracks`); } }),
   );
@@ -395,6 +398,11 @@ function homeSection(s) {
   return h('section', { class: 'home-section' }, h('h2', { text: s.title || 'For you' }), body);
 }
 
+// The live feed as last loaded in full; revisiting Home within HOME_TTL
+// shows it without asking YouTube again.
+let homeMemo = null;
+const HOME_TTL = 5 * 60 * 1000;
+
 // Home renders progressively: the last saved copy appears instantly, then the
 // live feed replaces it page by page as each page arrives.
 async function renderHome(token, show) {
@@ -407,6 +415,10 @@ async function renderHome(token, show) {
   renderPinned(slot);
   header.push(slot);
   const stale = () => token !== renderToken;
+  if (homeMemo && Date.now() - homeMemo.at < HOME_TTL) {
+    show(...header, ...homeMemo.sections.map(homeSection));
+    return;
+  }
 
   const cached = await invoke('home_cached').catch(() => []);
   if (stale()) return;
@@ -415,6 +427,7 @@ async function renderHome(token, show) {
   let page = await call('home_page', { token: null });
   if (stale()) return;
   const live = h('div');
+  const sections = [...page.sections];
   live.append(...page.sections.map(homeSection));
   show(...header, live);
   if (!page.sections.length && !page.next) {
@@ -424,8 +437,10 @@ async function renderHome(token, show) {
   for (let i = 0; i < 6 && page.next; i++) {
     page = await call('home_page', { token: page.next });
     if (stale()) return;
+    sections.push(...page.sections);
     live.append(...page.sections.map(homeSection));
   }
+  homeMemo = { at: Date.now(), sections };
 }
 
 async function renderSearch(query) {
@@ -443,15 +458,27 @@ async function renderSearch(query) {
   ].flat();
 }
 
+// Library lists as last loaded (Liked songs alone can be 10 requests).
+// Dropped on account changes made here and on sign-in/out.
+const libMemo = new Map();
+const LIB_TTL = 5 * 60 * 1000;
+async function library(kind) {
+  const m = libMemo.get(kind);
+  if (m && Date.now() - m.at < LIB_TTL) return m.items;
+  const items = await call('library', { kind });
+  libMemo.set(kind, { at: Date.now(), items });
+  return items;
+}
+
 async function renderLibraryTracks(kind, title) {
   if (!state.loggedIn) return needLogin();
-  const tracks = await call('library', { kind });
+  const tracks = await library(kind);
   return [h('h1', { text: title }), playButtons(tracks), trackList(tracks)];
 }
 
 async function renderLibraryCards(kind, title, mk) {
   if (!state.loggedIn) return needLogin();
-  const items = await call('library', { kind });
+  const items = await library(kind);
   return [h('h1', { text: title }), items.length ? h('div', { class: 'grid' }, items.map(mk)) : h('div', { class: 'empty', text: 'Nothing here yet.' })];
 }
 
@@ -459,12 +486,12 @@ async function renderPlaylist(id, fallback = {}) {
   const p = await call('playlist', { id });
   const tracks = p.tracks;
   const thumbs = p.thumbnail.length ? p.thumbnail : (fallback.thumbs || []);
-  // Your own playlists are exactly the ones in the "add to playlist" list.
-  let editable = false;
-  if (state.loggedIn && tracks.length) {
-    const mine = await invoke('playlist_options', { id: tracks[0].id }).catch(() => []);
-    editable = mine.some((o) => o.id === id);
+  // Your own playlists are exactly the ones in the "add to playlist" list
+  // (asked once, then remembered for a while).
+  if (state.loggedIn && tracks.length && !(ownPlaylists && Date.now() - ownPlaylists.at < OWN_TTL)) {
+    try { noteOwnPlaylists(await invoke('playlist_options', { id: tracks[0].id })); } catch (e) { /* not editable */ }
   }
+  const editable = !!(state.loggedIn && ownPlaylists && ownPlaylists.ids.has(id));
   return [detailHead(thumbs, p.name || fallback.title || 'Mix', [p.channel && p.channel.name, `${p.track_count || tracks.length} tracks`].filter(Boolean).join(' · ')),
     playButtons(tracks), trackList(tracks, { removeFrom: editable ? id : null })];
 }
@@ -559,6 +586,7 @@ async function setRating(target) {
   showRating(next); // optimistic
   try {
     await call('rate_track', { id, rating: next });
+    libMemo.delete('liked');
     toast(next === 'like' ? 'Added to Liked music' : next === 'dislike' ? 'Disliked' : 'Rating removed');
   } catch (e) {
     if (rating.id === id) showRating(before);
@@ -583,13 +611,27 @@ function withLocalChanges(videoId, list) {
     return m && Date.now() - m.at < MEMBERSHIP_TTL ? { ...p, contains: m.contains } : p;
   });
 }
+// The ids of your own playlists, from the latest playlist_options answer.
+let ownPlaylists = null; // { ids: Set, at }
+const OWN_TTL = 10 * 60 * 1000;
+function noteOwnPlaylists(list) {
+  ownPlaylists = { ids: new Set(list.map((o) => o.id)), at: Date.now() };
+}
 function loadOptions(id) {
   if (options.id !== id || !options.promise) {
     options = { id, promise: invoke('playlist_options', { id }) };
-    options.promise.catch(() => { if (options.id === id) options.promise = null; }); // retry next time
+    options.promise.then(noteOwnPlaylists, () => { if (options.id === id) options.promise = null; }); // retry next time
   }
   return options.promise;
 }
+// Loaded when the button is approached rather than for every song, so the
+// menu still opens populated without two requests per track change.
+function preloadOptions() {
+  const t = state.now && state.now.track;
+  if (t && state.loggedIn) loadOptions(t.id).catch(() => {});
+}
+$('add-to-playlist').addEventListener('mouseenter', preloadOptions);
+$('add-to-playlist').addEventListener('focus', preloadOptions);
 
 $('add-to-playlist').addEventListener('click', async (e) => {
   e.stopPropagation();
@@ -639,15 +681,13 @@ $('add-to-playlist').addEventListener('click', async (e) => {
 document.addEventListener('click', (e) => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
 
+// Runs on every position tick (~4/s): only touch what changed.
+let lastError = null;
 function applyState(now) {
   const prevId = state.now && state.now.track && state.now.track.id;
   if (!prevId && now.track) showQueue();
   state.now = now;
   const t = now.track;
-  $('np-title').textContent = t ? t.name : 'Nothing playing';
-  $('np-artist').replaceChildren(...(t ? artistLinks(t.artists) : []));
-  const cover = t && thumb(t.cover);
-  if (cover) $('np-cover').src = cover; else $('np-cover').removeAttribute('src');
   // Always show what Play/Pause will do; loading is a ring around the button,
   // so the button stays usable (and its state honest) while a track starts.
   $('toggle').textContent = now.playing ? '⏸' : '▶';
@@ -662,14 +702,18 @@ function applyState(now) {
   }
   $('dur').textContent = fmt(now.duration);
   if (document.activeElement !== vol) vol.value = now.volume;
-  if (now.error) toast(`Playback failed: ${now.error}`);
+  if (now.error && now.error !== lastError) toast(`Playback failed: ${now.error}`);
+  lastError = now.error;
   const id = t && t.id;
   if (id !== prevId) {
+    $('np-title').textContent = t ? t.name : 'Nothing playing';
+    $('np-artist').replaceChildren(...(t ? artistLinks(t.artists) : []));
+    const cover = t && thumb(t.cover);
+    if (cover) $('np-cover').src = cover; else $('np-cover').removeAttribute('src');
     document.querySelector('.np-actions').hidden = !t || !state.loggedIn;
     $('titlebar-title').textContent = t ? `${t.name} — ${(t.artists || []).map((a) => a.name).join(', ')}` : 'TubeDesk';
     closeMenu();
     loadRating(id);
-    if (id && state.loggedIn) loadOptions(id).catch(() => {});
     for (const row of document.querySelectorAll('.track')) row.classList.toggle('current', row.dataset.id === id);
   }
 }
@@ -724,6 +768,19 @@ function applyQueue(q) {
   if (cur && !$('queue').hidden) cur.scrollIntoView({ block: 'nearest' });
 }
 
+// Track changes only move the highlight; the list is rebuilt on `queue` only.
+function applyQueueIndex(index) {
+  const rows = $('queue-list').children;
+  const old = rows[state.queue.index];
+  if (old) old.classList.remove('current');
+  state.queue.index = index;
+  const cur = rows[index];
+  if (cur) {
+    cur.classList.add('current');
+    if (!$('queue').hidden) cur.scrollIntoView({ block: 'nearest' });
+  }
+}
+
 function applyAuth(a) {
   const changed = state.loggedIn !== a.logged_in;
   state.loggedIn = a.logged_in;
@@ -733,6 +790,11 @@ function applyAuth(a) {
   $('account-nav').querySelector('.label').textContent = a.logged_in ? 'Account' : 'Sign in';
   $('account-nav').title = a.logged_in ? 'Account (signed in)' : 'Sign in';
   if (a.error) toast(a.error);
+  if (changed) {
+    homeMemo = null;
+    libMemo.clear();
+    ownPlaylists = null;
+  }
   if (changed && state.current) navigate(state.current);
 }
 
@@ -741,6 +803,7 @@ function applyAuth(a) {
 (async () => {
   await listen('state', (e) => applyState(e.payload));
   await listen('queue', (e) => applyQueue(e.payload));
+  await listen('queue_index', (e) => applyQueueIndex(e.payload.index));
   await listen('auth', (e) => applyAuth(e.payload));
   invoke('sync');
   try { setPins(await invoke('pins')); } catch (e) { /* none yet */ }

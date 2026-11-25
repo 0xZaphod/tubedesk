@@ -58,17 +58,22 @@ Testing caveats:
   "quick" URL while yt-dlp runs, then continues from yt-dlp's "full" URL.
   Both sides must request the same itag (`resolver.rs`), and sizes are checked
   before bytes are mixed.
-- Upcoming tracks are "warmed": their first 1 MiB is fetched and kept.
+- The next two queue tracks (not hover hints) are "warmed": their first
+  1 MiB is fetched and kept. Warming and full-URL requests wait out the
+  ~3.5 s refusal window instead of retrying into 403s.
 
 **Core (`core.rs`) is a single actor** owning the queue and playback state.
 Everything talks to it via `CoreHandle::send(CoreMsg)`: Tauri commands, the
 MPRIS thread (`media.rs`), the tray, and the player thread's events. It emits
-`state` and `queue` events to the UI and persists `session.json` (queue, index,
-position) for restore-on-start.
-- Lookups: `request_now` (foreground, the track the user waits for) bypasses
-  the 2-slot background semaphore in `resolver.rs` that limits concurrent
-  yt-dlp+deno processes; prefetches (`prefetch_ahead`, hover hints, pinned
-  lists) go through it.
+`state`, `queue` (contents changed) and `queue_index` (track changed) events
+to the UI and persists `session.json` (queue, index, position) for
+restore-on-start.
+- Lookups run on `resolver::Lane`s: `Now` (the track the user waits for,
+  unlimited), `Ahead` (2 slots: `prefetch_ahead`, a list's first track) and
+  `Speculative` (1 slot, dropped when busy or stale: hover hints, prepared and
+  pinned lists), so guesses never delay the next track.
+- A list's later pages arrive as `Extend` tagged with the `PlayList` token;
+  anything started in between invalidates it.
 - Resuming at a position uses `PlayerCmd::LoadAt`: preroll paused, seek, then
   play, so the start isn't heard.
 

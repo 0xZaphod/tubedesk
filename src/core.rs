@@ -4,11 +4,12 @@
 use crate::media::MediaState;
 use crate::player::{Player, PlayerCmd, PlayerEvent};
 use crate::proxy::StreamProxy;
-use crate::resolver::{self, Stream};
+use crate::resolver::{self, Lane, Stream};
 use rustypipe::client::RustyPipe;
 use rustypipe::model::TrackItem;
 use std::collections::HashMap;
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender as StdSender;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -29,14 +30,17 @@ pub enum CoreMsg {
     /// A shuffled list: any track may come first, so one whose stream is
     /// already prepared is moved to the front to start instantly.
     PlayShuffled(Vec<TrackItem>),
+    /// The first page of a list (shuffled or not); its remaining pages follow
+    /// as `Extend` with the same `token` (see [`list_token`]).
+    PlayList { tracks: Vec<TrackItem>, shuffled: bool, token: u64 },
     Enqueue(Vec<TrackItem>),
     PlayNext(Vec<TrackItem>),
     JumpTo(usize),
     Remove(usize),
     Move { from: usize, to: usize },
-    /// More tracks of the list that was started with `anchor` as first track
-    /// (ignored if something else has been started since).
-    Extend { anchor: String, tracks: Vec<TrackItem> },
+    /// More tracks of the list started by `PlayList` with this `token`
+    /// (ignored if anything else has been started or the queue cleared since).
+    Extend { token: u64, tracks: Vec<TrackItem> },
     /// Prepare a track the user is likely to play next. `priority`: a likely
     /// pick (a list's first track), never dropped; otherwise a speculative
     /// hint (hover), dropped while several lookups are running.
@@ -57,8 +61,12 @@ pub enum CoreMsg {
 #[derive(Clone)]
 pub struct CoreHandle(UnboundedSender<CoreMsg>);
 
-/// Upper bound of a list's first page (YouTube pages hold 100 items).
-const LIST_PAGE: usize = 100;
+static NEXT_LIST_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// A new token tying a list's `Extend` messages to its `PlayList`.
+pub fn list_token() -> u64 {
+    NEXT_LIST_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
 
 impl CoreHandle {
     pub fn send(&self, msg: CoreMsg) {
@@ -109,6 +117,14 @@ struct Session {
     duration: f64,
 }
 
+/// Lookups of one track id in flight.
+#[derive(Default)]
+struct Lookup {
+    /// One of them is a foreground lookup (the track the user waits for).
+    foreground: bool,
+    running: u32,
+}
+
 struct Core {
     app: AppHandle,
     rp: RustyPipe,
@@ -122,10 +138,15 @@ struct Core {
     now: NowPlaying,
     /// Track id the current track is waiting on to be resolved (not loaded yet).
     awaiting: Option<String>,
-    /// Ids with a yt-dlp lookup in flight, so each id is resolved at most once at a time.
-    /// Lookups in flight: id → true if it is a foreground lookup (the track
-    /// the user is waiting for), false for a background prefetch.
-    inflight: HashMap<String, bool>,
+    /// yt-dlp lookups in flight by id: at most one background and one
+    /// foreground lookup per id.
+    inflight: HashMap<String, Lookup>,
+    /// Token of the list being played, while its later pages may still arrive.
+    list_token: Option<u64>,
+    /// Track id the tray tooltip / window title were last set for.
+    titled: Option<Option<String>>,
+    /// The queue or index changed: save the session once the message is handled.
+    dirty: bool,
     /// Restored from the last session but not loaded yet: Play resumes it.
     restored: bool,
     /// Seek here once the (resumed) track starts playing.
@@ -162,6 +183,9 @@ pub fn spawn(
         index: None,
         awaiting: None,
         inflight: Default::default(),
+        list_token: None,
+        titled: None,
+        dirty: false,
         restored: false,
         pending_seek: None,
         saved_at: None,
@@ -179,6 +203,9 @@ impl Core {
     async fn run(mut self, mut rx: UnboundedReceiver<CoreMsg>) {
         while let Some(msg) = rx.recv().await {
             self.handle(msg);
+            if std::mem::take(&mut self.dirty) {
+                self.save_session();
+            }
         }
     }
 
@@ -187,6 +214,7 @@ impl Core {
             CoreMsg::PlayTracks { tracks, start } => {
                 self.queue = tracks;
                 self.radio_requested_for = None;
+                self.list_token = None;
                 self.start_at(start.min(self.queue.len().saturating_sub(1)));
                 self.emit_queue();
             }
@@ -199,6 +227,10 @@ impl Core {
                     }
                 }
                 self.handle(CoreMsg::PlayTracks { tracks, start: 0 });
+            }
+            CoreMsg::PlayList { tracks, shuffled, token } => {
+                self.handle(if shuffled { CoreMsg::PlayShuffled(tracks) } else { CoreMsg::PlayTracks { tracks, start: 0 } });
+                self.list_token = Some(token);
             }
             CoreMsg::Enqueue(tracks) => {
                 let was_empty = self.queue.is_empty();
@@ -257,10 +289,9 @@ impl Core {
                 }
             }
             CoreMsg::Move { .. } => {}
-            CoreMsg::Extend { anchor, tracks } => {
-                // The anchor (the list's first track) may have been swapped
-                // further back by PlayShuffled, so look a little further.
-                if self.queue.iter().take(LIST_PAGE).any(|t| t.id == anchor) {
+            CoreMsg::Extend { token, tracks } => {
+                if self.list_token == Some(token) {
+                    self.list_token = None; // a list's rest arrives once
                     log::info!("appended {} more tracks of the list", tracks.len());
                     self.queue.extend(tracks);
                     self.emit_queue();
@@ -280,6 +311,7 @@ impl Core {
             }
             CoreMsg::Clear => {
                 self.queue.clear();
+                self.list_token = None;
                 self.stop();
                 self.emit_queue();
             }
@@ -305,7 +337,16 @@ impl Core {
                 }
             }
             CoreMsg::Resolved { id, result } => {
-                self.inflight.remove(&id);
+                let others_running = match self.inflight.get_mut(&id) {
+                    Some(l) if l.running > 1 => {
+                        l.running -= 1;
+                        true
+                    }
+                    _ => {
+                        self.inflight.remove(&id);
+                        false
+                    }
+                };
                 let wanted = self.awaiting.as_deref() == Some(id.as_str());
                 // Fill in a missing length for the shown track (e.g. a restored
                 // session or a home-feed track without duration).
@@ -320,19 +361,36 @@ impl Core {
                     }
                 }
                 match result {
+                    // The second of two lookups of the same track: keep the
+                    // first URL, it may be in use already (and a new one is
+                    // refused for a few seconds).
+                    Ok(_) if !wanted && self.streams.get(&id).is_some_and(|s| s.is_fresh()) => {
+                        log::debug!("{id}: already resolved; keeping the first URL");
+                    }
                     Ok(stream) => {
                         self.cache_stream(id.clone(), stream.clone());
                         if wanted {
                             self.load(&id, &stream);
                         } else {
-                            // Upcoming track: register it and pre-fetch its start.
+                            // Upcoming track: register it; pre-fetch its start
+                            // only if it is next in the queue (not for hover hints).
                             self.proxy.register(&id, &stream);
-                            let proxy = self.proxy.clone();
-                            tauri::async_runtime::spawn(async move { proxy.warm(&id).await });
+                            if self.should_warm(&id) {
+                                self.warm(&id);
+                            }
                         }
                     }
+                    Err(e) if others_running => log::debug!("lookup of {id} failed ({e}); another one is still running"),
                     Err(e) if wanted => {
                         self.awaiting = None;
+                        self.failed(e);
+                    }
+                    // Playing from the quick URL, which only covers the start:
+                    // without a full URL the song would stall, so skip it now.
+                    Err(e) if self.playing_quick_only(&id) => {
+                        log::warn!("{id}: no full stream URL; stopping after the quick start");
+                        self.player.send(PlayerCmd::Stop);
+                        self.proxy.forget(&id);
                         self.failed(e);
                     }
                     Err(e) => log::debug!("background resolve of {id} failed: {e}"),
@@ -398,6 +456,7 @@ impl Core {
         self.index = None;
         self.now = NowPlaying { volume: self.now.volume, ..Default::default() };
         self.emit_state();
+        self.emit_index();
     }
 
     fn start_at(&mut self, i: usize) {
@@ -430,7 +489,7 @@ impl Core {
             ..Default::default()
         };
         self.emit_state();
-        self.emit_queue();
+        self.emit_index();
 
         // Play right away if the stream was prefetched, else wait for (possibly
         // already running) resolve.
@@ -569,29 +628,32 @@ impl Core {
         let Some(id) = self.queue.get(i).map(|t| t.id.clone()) else { return };
         match self.streams.get(&id).filter(|s| s.is_fresh()) {
             // Already prepared: re-register so the proxy keeps its warmed start
-            // (its eviction is oldest-registered-first).
+            // (its eviction is oldest-registered-first), and warm it if it was
+            // only resolved as a hover hint.
             Some(s) => {
                 self.proxy.register(&id, s);
+                self.warm(&id);
             }
             None => self.request(&id),
         }
     }
 
-    /// Like `request`, but dropped when several lookups are already running,
-    /// so speculative prefetches (hover) never pile up yt-dlp processes.
+    /// A speculative lookup (hover hint): dropped when several lookups are
+    /// already running, and on its own lane so it never delays the queue's
+    /// next tracks.
     fn request_background(&mut self, id: &str) {
-        if self.inflight.len() < 4 {
-            self.request(id);
+        if self.inflight.len() < 4 && !self.inflight.contains_key(id) {
+            self.spawn_resolve(id, Lane::Speculative);
         }
     }
 
-    /// Starts a background lookup for `id` (prefetch) unless one is already
-    /// running. Background lookups queue up and run at most two at a time.
+    /// Starts a background lookup for `id` (an upcoming or likely track)
+    /// unless one is already running.
     fn request(&mut self, id: &str) {
         if self.inflight.contains_key(id) {
             return;
         }
-        self.spawn_resolve(id, false);
+        self.spawn_resolve(id, Lane::Ahead);
     }
 
     /// Starts a lookup for the track the user is waiting for, bypassing the
@@ -599,22 +661,45 @@ impl Core {
     /// background lookup, a foreground one is started anyway; whichever
     /// finishes first plays.
     fn request_now(&mut self, id: &str) {
-        if self.inflight.get(id) == Some(&true) {
+        if self.inflight.get(id).is_some_and(|l| l.foreground) {
             return;
         }
-        self.spawn_resolve(id, true);
+        self.spawn_resolve(id, Lane::Now);
     }
 
-    fn spawn_resolve(&mut self, id: &str, foreground: bool) {
-        self.inflight.insert(id.to_string(), foreground);
+    fn spawn_resolve(&mut self, id: &str, lane: Lane) {
+        let lookup = self.inflight.entry(id.to_string()).or_default();
+        lookup.running += 1;
+        lookup.foreground |= lane == Lane::Now;
         let (me, ytdlp, hq, id) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality, id.to_string());
         tauri::async_runtime::spawn(async move {
-            let result = resolver::resolve(&ytdlp, &id, hq, !foreground).await;
+            let result = resolver::resolve(&ytdlp, &id, hq, lane).await;
             me.send(CoreMsg::Resolved { id, result });
         });
     }
 
-    fn emit_state(&self) {
+    /// Whether `id`'s start is worth downloading ahead: one of the next two
+    /// tracks, or the restored track that Play will resume.
+    fn should_warm(&self, id: &str) -> bool {
+        let Some(i) = self.index else { return false };
+        let first = if self.restored { i } else { i + 1 };
+        self.queue.iter().skip(first).take(i + 3 - first).any(|t| t.id == id)
+    }
+
+    fn warm(&self, id: &str) {
+        let (proxy, id) = (self.proxy.clone(), id.to_string());
+        tauri::async_runtime::spawn(async move { proxy.warm(&id).await });
+    }
+
+    /// The current track is playing from its quick URL and has no full URL.
+    fn playing_quick_only(&self, id: &str) -> bool {
+        !self.restored
+            && self.awaiting.is_none()
+            && self.now.track.as_ref().is_some_and(|t| t.id == id)
+            && !self.streams.get(id).is_some_and(|s| s.is_fresh())
+    }
+
+    fn emit_state(&mut self) {
         let _ = self.app.emit("state", &self.now);
         if let Some(tx) = &self.media {
             let t = self.now.track.as_ref();
@@ -628,12 +713,25 @@ impl Core {
                 duration: self.now.duration,
             });
         }
-        crate::update_tray_title(&self.app, self.now.track.as_ref());
+        // Only on track changes: this runs on every position tick.
+        let id = self.now.track.as_ref().map(|t| t.id.clone());
+        if self.titled.as_ref() != Some(&id) {
+            crate::update_tray_title(&self.app, self.now.track.as_ref());
+            self.titled = Some(id);
+        }
     }
 
-    fn emit_queue(&self) {
+    /// The whole queue (after its contents changed).
+    fn emit_queue(&mut self) {
         let _ = self.app.emit("queue", QueueView { tracks: &self.queue, index: self.index });
-        self.save_session();
+        self.dirty = true;
+    }
+
+    /// Only the current index (switching tracks), so the UI and the session
+    /// file don't handle the whole queue on every track change.
+    fn emit_index(&mut self) {
+        let _ = self.app.emit("queue_index", serde_json::json!({ "index": self.index }));
+        self.dirty = true;
     }
 
     fn save_session(&self) {

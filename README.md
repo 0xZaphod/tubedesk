@@ -1,103 +1,114 @@
 # TubeDesk
 
-A lightweight, audio-only YouTube Music desktop player built on Tauri 2 / Rust.
-It uses the system webview (WebKitGTK on Linux, WebView2 on Windows, WKWebView on
-macOS) instead of a bundled Chromium.
+A lightweight, audio-only YouTube Music desktop client built with Tauri 2 / Rust.
+It doesn't wrap the YouTube Music site. The UI is its own, playback runs
+natively in Rust, and it downloads only audio streams. With no YouTube page
+loaded, there are no ads to block.
 
 ## Features
 
-- **YouTube Music, audio-only**: music videos switch to their "Song" version when
-  YouTube Music has one. Otherwise the video is hidden behind the album art and
-  pinned to the lowest quality.
-- **uBlock-Origin-style ad blocking without the extension** (Brave's `adblock` crate):
-  - uBO + EasyList + EasyPrivacy filter lists, downloaded and cached, refreshed every 4 days
-  - uBO scriptlets (`##+js(...)`): strip ads out of YouTube's player responses
-  - cosmetic CSS and procedural filters (`:has-text`, `:upward`, `:remove()`, …)
-  - network blocking via WebKit content filters (Linux), compiled once and cached
-  - a last-resort skipper that mutes and fast-forwards any ad that gets through
-- **Media controls**: MPRIS on Linux (media keys, desktop widgets), with title,
-  artist and artwork
-- **Tray**: play/pause, next, previous, show/hide, update filters, quit. Closing
-  the window hides it to the tray.
-- Single instance: launching it again just shows the window
+- Search songs, albums, artists and playlists; artist, album and playlist pages
+- **Your YouTube Music library**: liked songs, saved playlists, albums,
+  artists and history (sign-in required)
+- Audio-only playback through GStreamer: Opus, best or smallest stream
+- Queue with play next, add to queue and remove. When the queue runs out it
+  continues with YouTube Music's radio for the last track.
+- The next track is resolved in advance, so skipping is instant
+- MPRIS media controls (media keys and desktop widgets), tray menu, close to tray
+- Music keeps playing with the window hidden
 
-## Setup
-
-System packages (Arch):
+## Requirements (Arch)
 
 ```sh
-sudo pacman -S webkit2gtk-4.1 libayatana-appindicator gst-plugins-good gst-plugins-bad gst-libav
+sudo pacman -S webkit2gtk-4.1 libayatana-appindicator \
+  gstreamer gst-plugins-base gst-plugins-good gst-libav \
+  yt-dlp deno
 ```
 
-### 1. Generate the uBO scriptlets (required for ad stripping)
+`yt-dlp` resolves the audio streams, and `deno` lets it solve YouTube's
+JavaScript challenges. Keep yt-dlp up to date. When YouTube changes things,
+that's the part that breaks first.
+
+## Run
 
 ```sh
-node scripts/build-scriptlets.mjs                # clones uBO at a pinned tag
-node scripts/build-scriptlets.mjs ~/src/uBlock   # or use a local checkout
+cargo run
+RUST_LOG=tubedesk=debug cargo run                 # verbose logging
+cargo run -- --play "daft punk get lucky"         # search and play right away
+TUBEDESK_AUDIO_SINK="fakesink sync=true" cargo run -- --play "…"   # silent test
+cargo build --release
 ```
 
-This imports uBlock Origin's scriptlet modules with Node and writes
-`resources/ubo-scriptlets.json`, which gets compiled into the binary. Until you
-run it, the app starts with a warning and only network, cosmetic and fallback
-blocking work. Re-run it (bumping `UBO_TAG`) when uBO releases scriptlet fixes.
+Installable bundles: `cargo install tauri-cli --version "^2"` then `cargo tauri build`.
 
-### 2. Build and run
+## Signing in
 
-```sh
-cargo run                # debug
-cargo build --release    # optimized, ~10 MB binary
-RUST_LOG=tubedesk=debug cargo run   # log player state / blocking details
-```
+Under **Sign in** in the sidebar:
 
-For installable bundles (`.deb`, `.rpm`, AppImage), install the Tauri CLI
-(`cargo install tauri-cli --version "^2"`) and run `cargo tauri build`.
+1. **Sign in with Google** opens a private login window. Once Google
+   redirects back, the app copies the YouTube session cookies and closes the
+   window, so nothing else keeps using (and rotating) that session.
+2. **Import cookies.txt** is for when Google refuses to sign in inside the
+   app. Sign in at music.youtube.com in a *private/incognito* window of your
+   normal browser, export the youtube.com cookies in Netscape `cookies.txt`
+   format, **close that private window**, then import the file.
+
+The session cookie is stored by rustypipe in
+`~/.local/share/dev.tubedesk.app/rustypipe_cache.json` (the directory is
+`0700`). Treat it like a password. Signing out removes it.
 
 ## Configuration
 
-`~/.config/dev.tubedesk.app/config.json` (created on first run):
+`~/.config/dev.tubedesk.app/config.json`:
 
 | key | default | |
 |---|---|---|
-| `audio_only` | `true` | never show video |
-| `adblock` | `true` | master switch for all blocking |
-| `network_filtering` | `true` | WebKit content filters (Linux) |
-| `media_controls` | `true` | MPRIS; disable if your desktop shows a duplicate player |
+| `high_quality` | `true` | best Opus stream (~130–160 kbps) vs the smallest |
+| `autoplay_radio` | `true` | continue with radio when the queue ends |
+| `volume` | `0.8` | remembered volume |
+| `media_controls` | `true` | MPRIS / media keys |
 | `close_to_tray` | `true` | close button hides the window |
-| `filter_max_age_hours` | `96` | filter list refresh interval |
-| `user_agent` | `null` | override the webview user agent |
-
-Filter lists are cached in `~/.cache/dev.tubedesk.app/filters/`. Compiled WebKit
-filters are in `~/.local/share/dev.tubedesk.app/content-filters/`.
+| `login_user_agent` | `null` | user agent for the Google login window |
+| `ytdlp` | `"yt-dlp"` | yt-dlp executable |
 
 ## How it works
 
 ```
-src/lib.rs              app setup, window, tray, IPC command
-src/filters.rs          filter list download/cache
-src/adblock.rs          adblock-rust engine → init script + WebKit rules
-src/netfilter_linux.rs  WebKitUserContentFilterStore FFI
-src/media.rs            souvlaki media controls thread
-js/bridge.js            injected: state reporting, controls, audio-only, ad fallback
-js/procedural.js        injected: procedural cosmetic filter executor
-scripts/build-scriptlets.mjs  uBO scriptlets → adblock-rust resources
+ui/                   HTML/CSS/JS frontend (no build step)
+src/lib.rs            Tauri commands, tray, setup
+src/core.rs           queue, playback orchestration, radio, prefetch
+src/player.rs         GStreamer playbin thread (audio only)
+src/resolver.rs       yt-dlp → audio stream URL + required headers
+src/proxy.rs          local 127.0.0.1 proxy GStreamer streams from
+src/auth.rs           login window / cookies.txt → rustypipe cookie auth
+src/media.rs          souvlaki MPRIS thread
 ```
 
-The injected scripts reach Rust only through the `player_state` command.
-`capabilities/music.json` grants that one command to `https://music.youtube.com/*`
-and nothing else.
+- **Metadata and library** come from [rustypipe](https://codeberg.org/ThetaDev/rustypipe)
+  (the YouTube Music internal API).
+- **Streams** come from yt-dlp. rustypipe's own stream URLs get cut off by
+  YouTube after about 1 MB without a PO token (that would need the separate
+  `rustypipe-botguard` binary).
+- **The proxy exists** because googlevideo.com refuses (403) requests without
+  a byte range, throttles big ones, and refuses brand-new URLs for about 2 s.
+  It fetches in 1 MiB ranged chunks with yt-dlp's headers, retries those early
+  403s, and honours GStreamer's `Range` requests for seeking.
+
+The UI only inserts remote text with `textContent`, and the CSP allows no
+remote scripts.
+
+The previous webview-wrapper version (music.youtube.com with uBO-style ad
+blocking) is tagged `wrapper-final`.
 
 ## Known limitations / TODO
 
-- Network blocking is Linux-only for now. macOS (`WKContentRuleListStore`, same JSON)
-  and Windows (WebView2 `WebResourceRequested`) are marked TODO in `src/lib.rs`.
-- Generic cosmetic filters (`##.ad-class` with no domain) are not applied. Only
-  rules that match music.youtube.com are.
-- Ad blocking on YouTube is an arms race. Server-side ad insertion would defeat
-  the scriptlets and leave only the fallback skipper.
-- Google sign-in may refuse embedded webviews. If it does, try setting `user_agent`.
-- Windows SMTC needs the window HWND passed to souvlaki (TODO in `src/media.rs`).
+- Startup of the *first* track takes ~5 s (yt-dlp, then YouTube's 2 s
+  warm-up). Later tracks are prefetched.
+- No liking or unliking and no playlist editing yet. rustypipe only reads the
+  library.
+- Google may refuse the embedded login window; use cookies.txt import.
+- Windows media controls need the window HWND (TODO in `src/media.rs`).
 
 ## License
 
-GPL-3.0-or-later. The generated `resources/ubo-scriptlets.json` is derived from
-uBlock Origin (GPL-3.0).
+GPL-3.0-or-later (rustypipe is GPL-3.0).

@@ -1,74 +1,240 @@
-mod adblock;
+mod auth;
 mod config;
-mod filters;
+mod core;
 mod media;
-#[cfg(target_os = "linux")]
-mod netfilter_linux;
+mod player;
+mod proxy;
+mod resolver;
 
-use config::{Config, START_URL};
-use media::PlayerState;
-use std::sync::mpsc::Sender;
+use crate::core::{Control, CoreConfig, CoreHandle, CoreMsg};
+use config::Config;
+use rustypipe::client::RustyPipe;
+use rustypipe::model::{Thumbnail, TrackItem};
+use serde::Serialize;
 use std::sync::Mutex;
-use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Manager, State, WindowEvent};
 
-const BRIDGE_JS: &str = include_str!("../js/bridge.js");
-const PROCEDURAL_JS: &str = include_str!("../js/procedural.js");
 const TRAY_ID: &str = "main-tray";
+/// Upper bound for tracks loaded from one playlist / library list.
+const LIST_LIMIT: usize = 1000;
 
-struct AppState {
-    media_tx: Mutex<Option<Sender<PlayerState>>>,
-    last: Mutex<PlayerState>,
+struct App {
+    rp: RustyPipe,
+    core: CoreHandle,
+    config: Mutex<Config>,
 }
 
-/// Called by js/bridge.js whenever playback state changes.
-#[tauri::command]
-fn player_state(app: AppHandle, state: tauri::State<'_, AppState>, player: PlayerState) {
-    log::debug!("player_state: {player:?}");
-    if player.ad {
-        // Never surface ads as "now playing".
-        return;
-    }
-    {
-        let mut last = state.last.lock().unwrap();
-        if last.title != player.title || last.artist != player.artist {
-            let tip = match (&player.title, &player.artist) {
-                (Some(t), Some(a)) => format!("{t} — {a}"),
-                (Some(t), None) => t.clone(),
-                _ => "TubeDesk".into(),
-            };
-            if let Some(tray) = app.tray_by_id(TRAY_ID) {
-                let _ = tray.set_tooltip(Some(&tip));
-            }
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.set_title(&tip);
-            }
+type Res<T> = Result<T, String>;
+fn err(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+/// Largest thumbnail up to ~600px wide (YouTube lists them small → large).
+pub fn best_thumb(thumbs: &[Thumbnail]) -> Option<String> {
+    thumbs
+        .iter()
+        .filter(|t| t.width <= 600)
+        .max_by_key(|t| t.width)
+        .or(thumbs.last())
+        .map(|t| t.url.clone())
+}
+
+pub fn update_tray_title(app: &AppHandle, track: Option<&TrackItem>) {
+    let tip = match track {
+        Some(t) => {
+            let artists = t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+            if artists.is_empty() { t.name.clone() } else { format!("{} — {artists}", t.name) }
         }
-        *last = player.clone();
+        None => "TubeDesk".into(),
+    };
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_tooltip(Some(&tip));
     }
-    if let Some(tx) = state.media_tx.lock().unwrap().as_ref() {
-        let _ = tx.send(player);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_title(&tip);
     }
 }
 
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+// ---- browsing --------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SearchResults {
+    tracks: Vec<TrackItem>,
+    albums: Vec<rustypipe::model::AlbumItem>,
+    artists: Vec<rustypipe::model::ArtistItem>,
+    playlists: Vec<rustypipe::model::MusicPlaylistItem>,
+}
+
+#[tauri::command]
+async fn search(app: State<'_, App>, query: String) -> Res<SearchResults> {
+    let q = app.rp.query();
+    let (tracks, albums, artists, playlists) = tokio::join!(
+        q.music_search_tracks(&query),
+        q.music_search_albums(&query),
+        q.music_search_artists(&query),
+        q.music_search_playlists(&query, false),
+    );
+    Ok(SearchResults {
+        tracks: tracks.map_err(err)?.items.items,
+        albums: albums.map(|r| r.items.items).unwrap_or_default(),
+        artists: artists.map(|r| r.items.items).unwrap_or_default(),
+        playlists: playlists.map(|r| r.items.items).unwrap_or_default(),
+    })
+}
+
+/// The signed-in user's YouTube Music library.
+#[tauri::command]
+async fn library(app: State<'_, App>, kind: String) -> Res<serde_json::Value> {
+    let q = app.rp.query();
+    let v = match kind.as_str() {
+        "liked" => {
+            let mut p = q.music_liked_tracks().await.map_err(err)?;
+            p.tracks.extend_limit(&q, LIST_LIMIT).await.map_err(err)?;
+            serde_json::to_value(p.tracks.items)
+        }
+        "playlists" => {
+            let mut p = q.music_saved_playlists().await.map_err(err)?;
+            p.extend_limit(&q, LIST_LIMIT).await.map_err(err)?;
+            serde_json::to_value(p.items)
+        }
+        "albums" => {
+            let mut p = q.music_saved_albums().await.map_err(err)?;
+            p.extend_limit(&q, LIST_LIMIT).await.map_err(err)?;
+            serde_json::to_value(p.items)
+        }
+        "artists" => {
+            let mut p = q.music_saved_artists().await.map_err(err)?;
+            p.extend_limit(&q, LIST_LIMIT).await.map_err(err)?;
+            serde_json::to_value(p.items)
+        }
+        "history" => {
+            let p = q.music_history().await.map_err(err)?;
+            serde_json::to_value(p.items.into_iter().map(|h| h.item).collect::<Vec<_>>())
+        }
+        other => return Err(format!("unknown library section {other}")),
+    };
+    v.map_err(err)
+}
+
+#[tauri::command]
+async fn playlist(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicPlaylist> {
+    let q = app.rp.query();
+    let mut p = q.music_playlist(&id).await.map_err(err)?;
+    p.tracks.extend_limit(&q, LIST_LIMIT).await.map_err(err)?;
+    Ok(p)
+}
+
+#[tauri::command]
+async fn album(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicAlbum> {
+    app.rp.query().music_album(&id).await.map_err(err)
+}
+
+#[tauri::command]
+async fn artist(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicArtist> {
+    app.rp.query().music_artist(&id, false).await.map_err(err)
+}
+
+// ---- playback --------------------------------------------------------------
+
+#[tauri::command]
+fn play(app: State<'_, App>, tracks: Vec<TrackItem>, start: usize) {
+    app.core.send(CoreMsg::PlayTracks { tracks, start });
+}
+
+#[tauri::command]
+fn enqueue(app: State<'_, App>, tracks: Vec<TrackItem>, next: bool) {
+    app.core.send(if next { CoreMsg::PlayNext(tracks) } else { CoreMsg::Enqueue(tracks) });
+}
+
+#[tauri::command]
+fn queue_jump(app: State<'_, App>, index: usize) {
+    app.core.send(CoreMsg::JumpTo(index));
+}
+
+#[tauri::command]
+fn queue_remove(app: State<'_, App>, index: usize) {
+    app.core.send(CoreMsg::Remove(index));
+}
+
+#[tauri::command]
+fn queue_clear(app: State<'_, App>) {
+    app.core.send(CoreMsg::Clear);
+}
+
+#[tauri::command]
+fn control(app: State<'_, App>, action: Control) {
+    app.core.send(CoreMsg::Control(action));
+}
+
+#[tauri::command]
+fn seek(app: State<'_, App>, position: f64) {
+    app.core.send(CoreMsg::SeekTo(position));
+}
+
+#[tauri::command]
+fn set_volume(app: State<'_, App>, volume: f64, persist: bool) {
+    app.core.send(CoreMsg::Volume(volume));
+    if persist {
+        let mut cfg = app.config.lock().unwrap();
+        cfg.volume = volume.clamp(0.0, 1.0);
+        cfg.save();
+    }
+}
+
+/// Re-sends the current `state` and `queue` events (UI start-up).
+#[tauri::command]
+fn sync(app: State<'_, App>) {
+    app.core.send(CoreMsg::Sync);
+}
+
+// ---- account ---------------------------------------------------------------
+
+#[tauri::command]
+async fn auth_status(app: State<'_, App>) -> Res<auth::AuthStatus> {
+    Ok(auth::status(&app.rp).await)
+}
+
+#[tauri::command]
+fn auth_login(handle: AppHandle, app: State<'_, App>) -> Res<()> {
+    let ua = app.config.lock().unwrap().login_user_agent.clone();
+    auth::open_login_window(&handle, app.rp.clone(), ua).map_err(err)
+}
+
+#[tauri::command]
+async fn auth_import(handle: AppHandle, app: State<'_, App>, cookies: String) -> Res<()> {
+    auth::import_cookies_txt(&app.rp, &cookies).await?;
+    auth::emit(&handle, true, None);
+    Ok(())
+}
+
+#[tauri::command]
+async fn auth_logout(handle: AppHandle, app: State<'_, App>) -> Res<()> {
+    auth::logout(&app.rp).await;
+    auth::emit(&handle, false, None);
+    Ok(())
+}
+
+// ---- app -------------------------------------------------------------------
+
+fn build_tray(app: &AppHandle, core: CoreHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle", "Play / Pause", true, None::<&str>)?;
     let next = MenuItem::with_id(app, "next", "Next", true, None::<&str>)?;
     let prev = MenuItem::with_id(app, "previous", "Previous", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Show / Hide window", true, None::<&str>)?;
-    let update = MenuItem::with_id(app, "update-filters", "Update filter lists && restart", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let sep = || PredefinedMenuItem::separator(app);
-    let menu = Menu::with_items(app, &[&toggle, &next, &prev, &sep()?, &show, &update, &sep()?, &quit])?;
+    let menu = Menu::with_items(app, &[&toggle, &next, &prev, &sep()?, &show, &sep()?, &quit])?;
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(app.default_window_icon().cloned().expect("bundled icon"))
         .tooltip("TubeDesk")
         .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "toggle" | "next" | "previous" => media::send_control(app, event.id.as_ref(), None),
+        .on_menu_event(move |app, event| match event.id.as_ref() {
+            "toggle" => core.send(CoreMsg::Control(Control::Toggle)),
+            "next" => core.send(CoreMsg::Control(Control::Next)),
+            "previous" => core.send(CoreMsg::Control(Control::Previous)),
             "show" => {
                 if let Some(w) = app.get_webview_window("main") {
                     if w.is_visible().unwrap_or(false) {
@@ -77,15 +243,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                         media::show_window(app);
                     }
                 }
-            }
-            "update-filters" => {
-                let app = app.clone();
-                std::thread::spawn(move || {
-                    if let Ok(dir) = app.path().app_cache_dir() {
-                        filters::refresh(&dir.join("filters"), Duration::ZERO);
-                    }
-                    app.restart();
-                });
             }
             "quit" => app.exit(0),
             _ => {}
@@ -96,69 +253,37 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle().clone();
-    let path = app.path();
-    let config_path = path.app_config_dir()?.join("config.json");
-    let filter_dir = path.app_cache_dir()?.join("filters");
-    #[allow(unused_variables)]
-    let content_filter_dir = path.app_data_dir()?.join("content-filters");
-    let config = Config::load_or_init(&config_path);
-    log::info!("config: {}", config_path.display());
+    let config = Config::load_or_init(&app.path().app_config_dir()?.join("config.json"));
 
-    // ---- ad blocking ----------------------------------------------------
-    let mut init_script = String::new();
-    let mut lists = Vec::new();
-    if config.adblock {
-        let max_age = Duration::from_secs(config.filter_max_age_hours * 3600);
-        if filters::none_cached(&filter_dir) {
-            log::info!("first run: downloading filter lists…");
-            filters::refresh(&filter_dir, max_age);
-        } else {
-            // Refresh in the background; new lists apply on next launch.
-            let dir = filter_dir.clone();
-            std::thread::spawn(move || filters::refresh(&dir, max_age));
-        }
-        lists = filters::load_cached(&filter_dir);
-        let blocking = adblock::build(&lists, PROCEDURAL_JS);
-        init_script.push_str(&blocking.init_script);
+    // rustypipe keeps its cache *and the account cookie* here: owner-only.
+    let data_dir = app.path().app_data_dir()?;
+    std::fs::create_dir_all(&data_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    init_script.push_str(&BRIDGE_JS.replace("__TD_AUDIO_ONLY__", if config.audio_only { "true" } else { "false" }));
+    let rp = RustyPipe::builder().storage_dir(&data_dir).build()?;
 
-    // ---- window -----------------------------------------------------------
-    let start: tauri::Url = START_URL.parse()?;
-    let use_netfilter = cfg!(target_os = "linux") && config.adblock && config.network_filtering && !lists.is_empty();
-    // With network filtering, start blank and navigate once the filter is attached,
-    // so the first page load is already filtered.
-    let initial = if use_netfilter { "about:blank".parse()? } else { start.clone() };
+    let proxy = tauri::async_runtime::block_on(proxy::StreamProxy::start())?;
 
-    let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(initial))
-        .title("TubeDesk")
-        .inner_size(1200.0, 800.0)
-        .min_inner_size(420.0, 400.0)
-        .initialization_script(&init_script);
-    if let Some(ua) = &config.user_agent {
-        builder = builder.user_agent(ua);
-    }
-    let window = builder.build()?;
+    let (core_tx, core_rx) = std::sync::mpsc::channel();
+    let media_tx = if config.media_controls { media::spawn(handle.clone(), core_rx) } else { None };
+    let core = core::spawn(
+        handle.clone(),
+        rp.clone(),
+        proxy,
+        media_tx,
+        CoreConfig {
+            volume: config.volume,
+            autoplay_radio: config.autoplay_radio,
+            high_quality: config.high_quality,
+            ytdlp: config.ytdlp.clone(),
+        },
+    )?;
+    let _ = core_tx.send(core.clone());
 
-    #[cfg(target_os = "linux")]
-    if use_netfilter {
-        let fingerprint = filters::fingerprint(&lists);
-        let start = start.to_string();
-        window.with_webview(move |pw| {
-            let wv = pw.inner();
-            let wv2 = wv.clone();
-            netfilter_linux::install(
-                &wv,
-                &content_filter_dir,
-                &fingerprint,
-                move || adblock::content_rules(&lists),
-                move || webkit2gtk::WebViewExt::load_uri(&wv2, &start),
-            );
-        })?;
-    }
-    // TODO(macos): WKContentRuleListStore accepts the same JSON as WebKitGTK.
-    // TODO(windows): block via WebView2's WebResourceRequested + adblock::Engine.
-
+    let window = app.get_webview_window("main").expect("main window from tauri.conf.json");
     if config.close_to_tray {
         let w = window.clone();
         window.on_window_event(move |e| {
@@ -169,13 +294,20 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // ---- integrations -----------------------------------------------------
-    build_tray(&handle)?;
-    let media_tx = if config.media_controls { media::spawn(handle.clone()) } else { None };
-    app.manage(AppState {
-        media_tx: Mutex::new(media_tx),
-        last: Mutex::new(PlayerState::default()),
-    });
+    // `tubedesk --play "query"`: search and play the top results right away.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(query) = args.iter().position(|a| a == "--play").and_then(|i| args.get(i + 1)).cloned() {
+        let (rp, core) = (rp.clone(), core.clone());
+        tauri::async_runtime::spawn(async move {
+            match rp.query().music_search_tracks(&query).await {
+                Ok(r) => core.send(CoreMsg::PlayTracks { tracks: r.items.items, start: 0 }),
+                Err(e) => log::warn!("--play search failed: {e}"),
+            }
+        });
+    }
+
+    build_tray(&handle, core.clone())?;
+    app.manage(App { rp, core, config: Mutex::new(config) });
     Ok(())
 }
 
@@ -184,7 +316,11 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
-        .invoke_handler(tauri::generate_handler![player_state])
+        .invoke_handler(tauri::generate_handler![
+            search, library, playlist, album, artist,
+            play, enqueue, queue_jump, queue_remove, queue_clear, control, seek, set_volume, sync,
+            auth_status, auth_login, auth_import, auth_logout,
+        ])
         .setup(setup)
         .run(tauri::generate_context!())
         .expect("error while running TubeDesk");

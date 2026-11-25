@@ -3,7 +3,6 @@
 use gstreamer as gst;
 use gst::prelude::*;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::Mutex;
 use std::time::Duration;
 
 /// Loudest the app ever plays: 50% of full scale (−6 dB).
@@ -41,7 +40,9 @@ pub enum PlayerEvent {
 
 #[derive(Clone)]
 pub struct Player {
-    tx: Sender<PlayerCmd>,
+    /// Shared so the bus handler can hold a `Weak` to it: when every Player
+    /// is dropped the channel disconnects and the player thread ends.
+    tx: std::sync::Arc<Sender<PlayerCmd>>,
 }
 
 impl Player {
@@ -56,10 +57,11 @@ impl Player {
         gst::init().map_err(|e| format!("GStreamer init failed: {e}"))?;
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+        let tx = std::sync::Arc::new(tx);
         std::thread::Builder::new()
             .name("player".into())
             .spawn({
-                let wake = tx.clone();
+                let wake = std::sync::Arc::downgrade(&tx);
                 move || run(rx, wake, volume, on_event, ready_tx)
             })
             .map_err(|e| e.to_string())?;
@@ -70,7 +72,7 @@ impl Player {
 
 fn run(
     rx: Receiver<PlayerCmd>,
-    wake: Sender<PlayerCmd>,
+    wake: std::sync::Weak<Sender<PlayerCmd>>,
     volume: f64,
     on_event: impl Fn(PlayerEvent),
     ready: Sender<Result<(), String>>,
@@ -95,11 +97,13 @@ fn run(
     let bus = playbin.bus().expect("playbin has a bus");
     // Wake the loop as soon as something it acts on is posted (end of track,
     // error, preroll done), instead of up to 250 ms later.
-    let wake = Mutex::new(wake);
+    // Only a weak handle, or it would keep the command channel open forever.
     bus.set_sync_handler(move |_, msg| {
         use gst::MessageView;
         if matches!(msg.view(), MessageView::Eos(..) | MessageView::Error(..) | MessageView::AsyncDone(..)) {
-            let _ = wake.lock().unwrap().send(PlayerCmd::Wake);
+            if let Some(tx) = wake.upgrade() {
+                let _ = tx.send(PlayerCmd::Wake);
+            }
         }
         gst::BusSyncReply::Pass
     });

@@ -12,7 +12,8 @@ the YouTube Music website. The webview-wrapper predecessor is the git tag
 ## Commands
 
 ```sh
-cargo build                                  # no tests or linters are set up
+cargo build
+cargo test                                   # a few unit tests (resolver); no linters set up
 RUST_LOG=tubedesk=debug cargo run            # normal dev run
 node --check ui/app.js                       # syntax-check the UI after edits
 

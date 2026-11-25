@@ -652,6 +652,19 @@ pub fn run() {
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)
-        .run(tauri::generate_context!())
-        .expect("error while running TubeDesk");
+        .build(tauri::generate_context!())
+        .expect("error while building TubeDesk")
+        .run(|app, event| {
+            // However the app quits (tray, MPRIS, window close): let the core
+            // write the session before the process ends.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<App>() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    state.core.send(CoreMsg::Shutdown(tx));
+                    if rx.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+                        log::warn!("session may not have been saved before quitting");
+                    }
+                }
+            }
+        });
 }

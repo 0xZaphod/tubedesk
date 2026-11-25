@@ -47,52 +47,58 @@ pub fn open_login_window(app: &AppHandle, rp: RustyPipe, user_agent: Option<Stri
         return Ok(());
     }
     let url = LOGIN_URL.parse().expect("valid login url");
-    // Redirects can report several YouTube pages; take the cookies once.
-    let taken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Redirects can report several YouTube pages. One check runs at a time;
+    // the cookies are taken once, from the first page that has the session.
+    let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut builder = WebviewWindowBuilder::new(app, LOGIN_LABEL, WebviewUrl::External(url))
         .title("Sign in to YouTube")
         .inner_size(480.0, 720.0)
         .incognito(true)
         .on_page_load(move |webview, payload| {
-            if payload.event() != PageLoadEvent::Started || !is_done(payload.url()) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if payload.event() != PageLoadEvent::Started || !is_done(payload.url()) || done.load(SeqCst) {
                 return;
             }
-            if taken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if busy.swap(true, SeqCst) {
                 return;
             }
             log::info!("login redirected back to {}", payload.url().host_str().unwrap_or_default());
-            let (rp, app) = (rp.clone(), webview.app_handle().clone());
-            let window = webview.clone();
+            let (rp, app, window) = (rp.clone(), webview.app_handle().clone(), webview.clone());
+            let (busy, done) = (busy.clone(), done.clone());
             // Cookie access must not happen on the event-loop thread (deadlocks on Windows).
             tauri::async_runtime::spawn(async move {
-                let cookies = window.cookies_for_url("https://www.youtube.com/".parse().unwrap());
-                let _ = window.destroy();
-                if let Ok(c) = &cookies {
-                    log::debug!("login cookies: {}", c.iter().map(|c| c.name()).collect::<Vec<_>>().join(", "));
-                }
-                let result = match cookies {
-                    Ok(c) => {
-                        let header = c
-                            .iter()
-                            .map(|c| format!("{}={}", c.name(), c.value()))
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        if !header.contains("SAPISID") {
-                            Err("sign-in did not complete (no session cookie)".to_string())
-                        } else {
-                            rp.user_auth_set_cookie(header).await.map_err(|e| e.to_string())
+                // The session cookie may be committed a moment after this
+                // redirect starts loading: look a few times before giving up.
+                let mut header = None;
+                for attempt in 0..10 {
+                    match window.cookies_for_url("https://www.youtube.com/".parse().unwrap()) {
+                        Ok(c) if c.iter().any(|c| c.name() == "SAPISID") => {
+                            log::debug!("login cookies: {}", c.iter().map(|c| c.name()).collect::<Vec<_>>().join(", "));
+                            header = Some(c.iter().map(|c| format!("{}={}", c.name(), c.value())).collect::<Vec<_>>().join("; "));
+                            break;
                         }
+                        Ok(_) => log::debug!("no session cookie yet (attempt {})", attempt + 1),
+                        Err(e) => log::debug!("could not read cookies: {e}"),
                     }
-                    Err(e) => Err(format!("could not read cookies: {e}")),
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                let Some(header) = header else {
+                    // Not signed in (yet): keep the window open so a later
+                    // redirect, or the user finishing the login, can complete it.
+                    busy.store(false, SeqCst);
+                    return;
                 };
-                match result {
+                done.store(true, SeqCst);
+                let _ = window.destroy();
+                match rp.user_auth_set_cookie(header).await {
                     Ok(()) => {
                         log::info!("signed in");
                         emit(&app, true, None);
                     }
                     Err(e) => {
                         log::warn!("sign-in failed: {e}");
-                        emit(&app, false, Some(e));
+                        emit(&app, false, Some(e.to_string()));
                     }
                 }
             });

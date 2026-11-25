@@ -59,6 +59,9 @@ pub enum CoreMsg {
     Refresh(String),
     RadioLoaded { for_id: String, tracks: Vec<TrackItem> },
     Sync,
+    /// The app is quitting: save the session now and acknowledge once it is
+    /// written (the writer thread would otherwise be cut off mid-write).
+    Shutdown(StdSender<()>),
 }
 
 #[derive(Clone)]
@@ -133,6 +136,10 @@ struct ListInfo {
 struct Lookup {
     /// One of them is a foreground lookup (the track the user waits for).
     foreground: bool,
+    /// Only speculative (hover) lookups are running: such a lookup can wait
+    /// behind other hints and is dropped when stale, so it must not stand in
+    /// for preparing an upcoming track.
+    speculative_only: bool,
     running: u32,
     /// Lets the background lookup skip its queue (see `request_now`).
     promotion: Option<Arc<Promotion>>,
@@ -169,9 +176,12 @@ struct Core {
     /// The queue or index changed: save the session once the message is handled.
     dirty: bool,
     /// Latest session file contents, for the writer thread.
-    session_tx: StdSender<Vec<u8>>,
+    session_tx: StdSender<WriterMsg>,
     /// Restored from the last session but not loaded yet: Play resumes it.
     restored: bool,
+    /// The current track is playing from its quick URL and has no full URL
+    /// registered yet: if its lookup fails it would stall after the start.
+    quick_only: Option<String>,
     /// Seek here once the (resumed) track starts playing.
     pending_seek: Option<f64>,
     /// Position bucket of the last session save (saves every few seconds).
@@ -214,6 +224,7 @@ pub fn spawn(
         titled: None,
         dirty: false,
         restored: false,
+        quick_only: None,
         pending_seek: None,
         saved_at: None,
         consecutive_errors: 0,
@@ -226,17 +237,32 @@ pub fn spawn(
     Ok(me)
 }
 
+enum WriterMsg {
+    Save(Vec<u8>),
+    /// Acknowledged once everything sent before it is on disk.
+    Flush(StdSender<()>),
+}
+
 /// Writes the session file on its own thread (it can be large: the whole
 /// queue), skipping versions that were superseded before they got written.
-fn spawn_session_writer(path: std::path::PathBuf) -> StdSender<Vec<u8>> {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+fn spawn_session_writer(path: std::path::PathBuf) -> StdSender<WriterMsg> {
+    let (tx, rx) = std::sync::mpsc::channel::<WriterMsg>();
     let _ = std::thread::Builder::new().name("session-writer".into()).spawn(move || {
-        while let Ok(mut bytes) = rx.recv() {
-            while let Ok(newer) = rx.try_recv() {
-                bytes = newer;
+        while let Ok(first) = rx.recv() {
+            let (mut latest, mut acks) = (None, Vec::new());
+            for msg in std::iter::once(first).chain(rx.try_iter()) {
+                match msg {
+                    WriterMsg::Save(bytes) => latest = Some(bytes),
+                    WriterMsg::Flush(ack) => acks.push(ack),
+                }
             }
-            if let Err(e) = crate::config::write_atomic(&path, &bytes) {
-                log::debug!("could not save session: {e}");
+            if let Some(bytes) = latest {
+                if let Err(e) = crate::config::write_atomic(&path, &bytes) {
+                    log::debug!("could not save session: {e}");
+                }
+            }
+            for ack in acks {
+                let _ = ack.send(());
             }
         }
     });
@@ -389,6 +415,10 @@ impl Core {
                 self.emit_state();
             }
             CoreMsg::Player(ev) => self.player_event(ev),
+            CoreMsg::Shutdown(ack) => {
+                self.save_session();
+                let _ = self.session_tx.send(WriterMsg::Flush(ack));
+            }
             CoreMsg::Sync => {
                 self.emit_state();
                 self.emit_queue();
@@ -398,6 +428,7 @@ impl Core {
                     log::debug!("{id}: starting from the quick URL");
                     let uri = self.proxy.register_quick(&id, url, size, mime);
                     self.load_uri(uri);
+                    self.quick_only = Some(id);
                 }
             }
             CoreMsg::Resolved { id, result } => {
@@ -430,8 +461,16 @@ impl Core {
                     // refused for a few seconds).
                     Ok(_) if !wanted && self.streams.get(&id).is_some_and(|s| s.is_fresh()) => {
                         log::debug!("{id}: already resolved; keeping the first URL");
+                        if self.quick_only.as_deref() == Some(id.as_str()) {
+                            let s = self.streams[&id].clone();
+                            self.proxy.register(&id, &s);
+                            self.quick_only = None;
+                        }
                     }
                     Ok(stream) => {
+                        if self.quick_only.as_deref() == Some(id.as_str()) {
+                            self.quick_only = None; // its full URL is registered below
+                        }
                         self.cache_stream(id.clone(), stream.clone());
                         if wanted {
                             self.load(&id, &stream);
@@ -551,6 +590,7 @@ impl Core {
     }
 
     fn stop(&mut self) {
+        self.quick_only = None;
         self.awaiting = None;
         self.player.send(PlayerCmd::Stop);
         self.index = None;
@@ -569,6 +609,7 @@ impl Core {
     /// `play` false loads it paused.
     fn start_at_from(&mut self, i: usize, from: Option<f64>, play: bool) {
         self.restored = false;
+        self.quick_only = None;
         self.pending_seek = from;
         let Some(track) = self.queue.get(i).cloned() else { return };
         // Repeated play requests for a track that is still starting up (e.g. a
@@ -737,7 +778,11 @@ impl Core {
                     self.proxy.register(&id, s);
                     self.warm(&id);
                 }
-                None if !self.inflight.contains_key(&id) && !missing.contains(&id) => missing.push(id),
+                // A hover hint for it doesn't count: it may wait behind other
+                // hints and be dropped, so prepare it properly anyway.
+                None if !self.inflight.get(&id).is_some_and(|l| !l.speculative_only) && !missing.contains(&id) => {
+                    missing.push(id)
+                }
                 None => {}
             }
         }
@@ -758,7 +803,7 @@ impl Core {
     /// Starts a background lookup for `id` (an upcoming or likely track)
     /// unless one is already running.
     fn request(&mut self, id: &str) {
-        if self.inflight.contains_key(id) {
+        if self.inflight.get(id).is_some_and(|l| !l.speculative_only) {
             return;
         }
         self.spawn_resolve(vec![id.to_string()], Lane::Ahead);
@@ -786,7 +831,9 @@ impl Core {
     fn spawn_resolve(&mut self, ids: Vec<String>, lane: Lane) {
         let promotion = Arc::new(Promotion::default());
         for id in &ids {
+            let fresh = !self.inflight.contains_key(id);
             let lookup = self.inflight.entry(id.clone()).or_default();
+            lookup.speculative_only = lane == Lane::Speculative && (fresh || lookup.speculative_only);
             lookup.running += 1;
             lookup.foreground |= lane == Lane::Now;
             if lane != Lane::Now {
@@ -795,9 +842,9 @@ impl Core {
         }
         let (me, ytdlp, hq) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality);
         tauri::async_runtime::spawn(async move {
-            for (id, result) in resolver::resolve(&ytdlp, &ids, hq, lane, promotion).await {
-                me.send(CoreMsg::Resolved { id, result });
-            }
+            // Results arrive one by one as yt-dlp finishes each video, so the
+            // first of a batch isn't held back by the second.
+            resolver::resolve(&ytdlp, &ids, hq, lane, promotion, |id, result| me.send(CoreMsg::Resolved { id, result })).await;
         });
     }
 
@@ -819,11 +866,10 @@ impl Core {
     }
 
     /// The current track is playing from its quick URL and has no full URL.
+    /// Recorded explicitly: inferring it from "no fresh cached URL" also hit
+    /// tracks playing fine from a full URL that merely got old (long pause).
     fn playing_quick_only(&self, id: &str) -> bool {
-        !self.restored
-            && self.awaiting.is_none()
-            && self.now.track.as_ref().is_some_and(|t| t.id == id)
-            && !self.streams.get(id).is_some_and(|s| s.is_fresh())
+        self.quick_only.as_deref() == Some(id) && self.now.track.as_ref().is_some_and(|t| t.id == id)
     }
 
     fn emit_state(&mut self) {
@@ -870,7 +916,7 @@ impl Core {
         };
         match serde_json::to_vec(&s) {
             Ok(b) => {
-                let _ = self.session_tx.send(b);
+                let _ = self.session_tx.send(WriterMsg::Save(b));
             }
             Err(e) => log::debug!("could not serialize session: {e}"),
         }

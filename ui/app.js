@@ -291,6 +291,12 @@ function trackList(tracks, { removeFrom = null } = {}) {
           const k = tracks.indexOf(t);
           if (k >= 0) tracks.splice(k, 1);
           list.replaceWith(trackList(tracks, { removeFrom }));
+          const count = document.querySelector(`[data-count-for="${CSS.escape(removeFrom)}"]`);
+          if (count) {
+            count.dataset.n = String(Math.max(0, Number(count.dataset.n) - 1));
+            count.textContent = `${count.dataset.n} tracks`;
+          }
+          playlistsChanged();
         },
       }),
       h('button', { class: 'text', title: 'Play next', text: 'Next', onclick: () => { call('enqueue', { tracks: [t], next: true }); toast('Playing next'); } }),
@@ -320,7 +326,8 @@ function playButtons(tracks) {
   return h('div', { class: 'row-actions' },
     h('button', { class: 'btn', text: 'Play', onclick: () => call('play', { tracks, start: 0 }) }),
     h('button', { class: 'btn secondary', text: 'Shuffle', onclick: () => {
-      call('play', { tracks: order, start: 0 });
+      // `tracks` may have lost songs since (removed from your playlist).
+      call('play', { tracks: order.filter((t) => tracks.includes(t)), start: 0 });
       order = shuffledCopy(tracks); // next Shuffle gets a new order, prepared too
       invoke('prefetch', { id: order[0].id, priority: false });
     } }),
@@ -401,6 +408,13 @@ function homeSection(s) {
 // The live feed as last loaded in full; revisiting Home within HOME_TTL
 // shows it without asking YouTube again.
 let homeMemo = null;
+
+// A playlist's contents changed: cached Library playlists (counts,
+// thumbnails) and Home are stale now; reload them on the next visit.
+function playlistsChanged() {
+  libMemo.delete('playlists');
+  homeMemo = null;
+}
 const HOME_TTL = 5 * 60 * 1000;
 
 // Home renders progressively: the last saved copy appears instantly, then the
@@ -501,7 +515,9 @@ async function renderPlaylist(id, fallback = {}) {
     try { noteOwnPlaylists(await invoke('playlist_options', { id: tracks[0].id })); } catch (e) { /* not editable */ }
   }
   const editable = !!(state.loggedIn && ownPlaylists && ownPlaylists.ids.has(id));
-  return [detailHead(thumbs, p.name || fallback.title || 'Mix', [p.channel && p.channel.name, `${p.track_count || tracks.length} tracks`].filter(Boolean).join(' · ')),
+  const n = p.track_count || tracks.length;
+  const sub = [p.channel && p.channel.name && `${p.channel.name} · `, h('span', { 'data-count-for': id, 'data-n': String(n), text: `${n} tracks` })];
+  return [detailHead(thumbs, p.name || fallback.title || 'Mix', sub),
     playButtons(tracks), trackList(tracks, { removeFrom: editable ? id : null })];
 }
 
@@ -680,6 +696,7 @@ $('add-to-playlist').addEventListener('click', async (e) => {
           membership.set(key, { contains: true, at: Date.now() });
           toast(added ? `Added to ${p.title}` : `Already in ${p.title}`);
         }
+        playlistsChanged();
         // Refresh in the background (the order may change); local changes stay on top.
         options.promise = null;
         loadOptions(track.id).catch(() => {});

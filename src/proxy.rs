@@ -19,7 +19,7 @@
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -50,7 +50,7 @@ struct Full {
     url: String,
     headers: Vec<(String, String)>,
     registered: Instant,
-    expires: Option<SystemTime>,
+    expires: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -440,7 +440,7 @@ impl StreamProxy {
                 return Ok(());
             };
             // E.g. after a long pause: YouTube would refuse it.
-            if full.expires.is_some_and(|t| t <= SystemTime::now() + EXPIRY_MARGIN) {
+            if full.expires.is_some_and(|t| t <= Instant::now() + EXPIRY_MARGIN) {
                 log::info!("{id}: stream URL expired; asking for a new one");
                 if !self.request_refresh(&id, &full, &mut refreshed) {
                     return Ok(());

@@ -356,7 +356,7 @@ async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool)
     }
     let first = if shuffle { start.shuffled } else { start.tracks };
     let (anchor, first_len) = (first[0].id.clone(), first.len());
-    app.core.send(CoreMsg::PlayTracks { tracks: first, start: 0 });
+    app.core.send(if shuffle { CoreMsg::PlayShuffled(first) } else { CoreMsg::PlayTracks { tracks: first, start: 0 } });
 
     if let Some((mut pages, query)) = start.rest {
         let core = app.core.clone();

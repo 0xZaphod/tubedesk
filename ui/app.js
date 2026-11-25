@@ -193,6 +193,19 @@ function pinButton(item, cls) {
   }, svgIcon(PIN_PATH, 'pin-icon'));
 }
 
+// Pinned lists are the likeliest picks: prepare them in the background at
+// start-up (one after another, so the lookups don't all run at once).
+async function preparePinned() {
+  const lists = [...pinned.values()].filter((p) => ['playlist', 'album', 'mix'].includes(p.kind)).slice(0, 8);
+  for (const p of lists) {
+    const key = `l:${p.kind}:${p.id}`;
+    hinted.set(key, Date.now());
+    await invoke('prepare_list', { kind: p.kind, id: p.id }).catch(() => hinted.delete(key));
+    // Each list starts two song lookups in the background; let them finish.
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+
 function renderPinned(slot) {
   const items = [...pinned.values()];
   slot.replaceChildren(...(items.length
@@ -578,6 +591,7 @@ function applyAuth(a) {
   await listen('auth', (e) => applyAuth(e.payload));
   invoke('sync');
   try { setPins(await invoke('pins')); } catch (e) { /* none yet */ }
+  preparePinned();
   try { applyAuth(await invoke('auth_status')); } catch (e) { /* ignore */ }
   navigate({ name: 'home' });
 })();

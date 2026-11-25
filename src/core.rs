@@ -26,6 +26,9 @@ pub enum Control {
 
 pub enum CoreMsg {
     PlayTracks { tracks: Vec<TrackItem>, start: usize },
+    /// A shuffled list: any track may come first, so one whose stream is
+    /// already prepared is moved to the front to start instantly.
+    PlayShuffled(Vec<TrackItem>),
     Enqueue(Vec<TrackItem>),
     PlayNext(Vec<TrackItem>),
     JumpTo(usize),
@@ -51,6 +54,9 @@ pub enum CoreMsg {
 
 #[derive(Clone)]
 pub struct CoreHandle(UnboundedSender<CoreMsg>);
+
+/// Upper bound of a list's first page (YouTube pages hold 100 items).
+const LIST_PAGE: usize = 100;
 
 impl CoreHandle {
     pub fn send(&self, msg: CoreMsg) {
@@ -174,6 +180,16 @@ impl Core {
                 self.start_at(start.min(self.queue.len().saturating_sub(1)));
                 self.emit_queue();
             }
+            CoreMsg::PlayShuffled(mut tracks) => {
+                let first_ready = self.streams.get(&tracks[0].id).is_some_and(|s| s.is_fresh());
+                if !first_ready {
+                    if let Some(k) = tracks.iter().position(|t| self.streams.get(&t.id).is_some_and(|s| s.is_fresh())) {
+                        log::debug!("shuffle: starting with already prepared track {}", tracks[k].id);
+                        tracks.swap(0, k);
+                    }
+                }
+                self.handle(CoreMsg::PlayTracks { tracks, start: 0 });
+            }
             CoreMsg::Enqueue(tracks) => {
                 let was_empty = self.queue.is_empty();
                 self.queue.extend(tracks);
@@ -232,7 +248,9 @@ impl Core {
             }
             CoreMsg::Move { .. } => {}
             CoreMsg::Extend { anchor, tracks } => {
-                if self.queue.first().is_some_and(|t| t.id == anchor) {
+                // The anchor (the list's first track) may have been swapped
+                // further back by PlayShuffled, so look a little further.
+                if self.queue.iter().take(LIST_PAGE).any(|t| t.id == anchor) {
                     log::info!("appended {} more tracks of the list", tracks.len());
                     self.queue.extend(tracks);
                     self.emit_queue();

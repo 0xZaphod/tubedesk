@@ -115,7 +115,9 @@ struct Core {
     /// Track id the current track is waiting on to be resolved (not loaded yet).
     awaiting: Option<String>,
     /// Ids with a yt-dlp lookup in flight, so each id is resolved at most once at a time.
-    inflight: std::collections::HashSet<String>,
+    /// Lookups in flight: id → true if it is a foreground lookup (the track
+    /// the user is waiting for), false for a background prefetch.
+    inflight: HashMap<String, bool>,
     /// Restored from the last session but not loaded yet: Play resumes it.
     restored: bool,
     /// Seek here once the (resumed) track starts playing.
@@ -325,6 +327,7 @@ impl Core {
     }
 
     fn control(&mut self, c: Control) {
+        log::debug!("control {c:?} (playing={}, loading={})", self.now.playing, self.now.loading);
         match c {
             Control::Play | Control::Toggle if self.restored => self.resume(),
             Control::Play if self.index.is_none() && !self.queue.is_empty() => self.start_at(0),
@@ -388,7 +391,7 @@ impl Core {
             Some(stream) => self.load(&track.id, &stream),
             None => {
                 self.awaiting = Some(track.id.clone());
-                self.request(&track.id);
+                self.request_now(&track.id);
             }
         }
         self.prefetch_ahead(i);
@@ -514,14 +517,31 @@ impl Core {
         }
     }
 
-    /// Starts a yt-dlp lookup for `id` unless one is already running.
+    /// Starts a background lookup for `id` (prefetch) unless one is already
+    /// running. Background lookups queue up and run at most two at a time.
     fn request(&mut self, id: &str) {
-        if !self.inflight.insert(id.to_string()) {
+        if self.inflight.contains_key(id) {
             return;
         }
+        self.spawn_resolve(id, false);
+    }
+
+    /// Starts a lookup for the track the user is waiting for, bypassing the
+    /// background queue. If the same id is still queued or running as a
+    /// background lookup, a foreground one is started anyway; whichever
+    /// finishes first plays.
+    fn request_now(&mut self, id: &str) {
+        if self.inflight.get(id) == Some(&true) {
+            return;
+        }
+        self.spawn_resolve(id, true);
+    }
+
+    fn spawn_resolve(&mut self, id: &str, foreground: bool) {
+        self.inflight.insert(id.to_string(), foreground);
         let (me, ytdlp, hq, id) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality, id.to_string());
         tauri::async_runtime::spawn(async move {
-            let result = resolver::resolve(&ytdlp, &id, hq).await;
+            let result = resolver::resolve(&ytdlp, &id, hq, !foreground).await;
             me.send(CoreMsg::Resolved { id, result });
         });
     }

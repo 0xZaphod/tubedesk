@@ -9,6 +9,12 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
+
+/// Background lookups (prefetches) run at most this many at once: each
+/// yt-dlp run also starts deno to solve YouTube's JS challenges, and a burst
+/// of them slows everything down, including YouTube's warm-up and the UI.
+static BACKGROUND: Semaphore = Semaphore::const_new(2);
 
 /// Stream URLs expire after ~6 h; don't reuse cached ones near that.
 const MAX_AGE: Duration = Duration::from_secs(4 * 3600);
@@ -45,7 +51,9 @@ struct YtDlpFormat {
     abr: Option<f64>,
 }
 
-pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool) -> Result<Stream, String> {
+/// `background`: wait for one of the limited background slots first.
+pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool, background: bool) -> Result<Stream, String> {
+    let _permit = if background { Some(BACKGROUND.acquire().await.map_err(|e| e.to_string())?) } else { None };
     let format = if high_quality {
         "bestaudio[acodec=opus]/bestaudio"
     } else {

@@ -452,6 +452,7 @@ fn queue_clear(app: State<'_, App>) {
 
 #[tauri::command]
 fn control(app: State<'_, App>, action: Control) {
+    log::debug!("ui control {action:?}");
     app.core.send(CoreMsg::Control(action));
 }
 

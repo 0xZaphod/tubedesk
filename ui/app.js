@@ -420,26 +420,35 @@ async function renderHome(token, show) {
     return;
   }
 
+  // Saved sections not yet replaced by live ones. Each live section takes
+  // the place of one saved section, in place, so the page keeps its length
+  // (and scroll position) instead of shrinking to the first live page.
   const cached = await invoke('home_cached').catch(() => []);
   if (stale()) return;
-  if (cached.length) show(...header, ...cached.map(homeSection));
+  const tail = h('div', {}, cached.map(homeSection));
+  if (cached.length) show(...header, tail);
 
   let page = await call('home_page', { token: null });
   if (stale()) return;
-  const live = h('div');
-  const sections = [...page.sections];
-  live.append(...page.sections.map(homeSection));
-  show(...header, live);
   if (!page.sections.length && !page.next) {
     show(h('div', { class: 'empty', text: 'YouTube Music returned an empty home page.' }));
     return;
   }
+  const live = h('div');
+  if (tail.isConnected) tail.before(live); else show(...header, live);
+  const sections = [];
+  const add = (secs) => {
+    sections.push(...secs);
+    live.append(...secs.map(homeSection));
+    for (let k = 0; k < secs.length && tail.firstChild; k++) tail.firstChild.remove();
+  };
+  add(page.sections);
   for (let i = 0; i < 6 && page.next; i++) {
     page = await call('home_page', { token: page.next });
     if (stale()) return;
-    sections.push(...page.sections);
-    live.append(...page.sections.map(homeSection));
+    add(page.sections);
   }
+  tail.remove(); // saved sections the live feed no longer has
   homeMemo = { at: Date.now(), sections };
 }
 

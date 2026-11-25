@@ -7,9 +7,11 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 /// Background lookups run on limited lanes: each yt-dlp run also starts deno
 /// to solve YouTube's JS challenges, and a burst of them slows everything
@@ -19,6 +21,25 @@ static AHEAD: Semaphore = Semaphore::const_new(2);
 static SPECULATIVE: Semaphore = Semaphore::const_new(1);
 /// A speculative hint that waited this long for its slot is no longer worth it.
 const STALE_HINT: Duration = Duration::from_secs(20);
+
+/// Lets a queued background lookup skip its queue when the user starts
+/// waiting for it, instead of running a second lookup of the same track.
+#[derive(Default)]
+pub struct Promotion {
+    set: AtomicBool,
+    notify: Notify,
+}
+
+impl Promotion {
+    pub fn promote(&self) {
+        self.set.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    fn is_set(&self) -> bool {
+        self.set.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
@@ -95,26 +116,38 @@ pub async fn quick(rp: &rustypipe::client::RustyPipe, id: &str, high_quality: bo
 
 /// Looks up `ids` in one yt-dlp run (saving a Python start and a JS
 /// challenge solve per extra track). Returns a result for every id.
-pub async fn resolve(ytdlp: &str, ids: &[String], high_quality: bool, lane: Lane) -> Vec<(String, Result<Stream, String>)> {
+/// A queued lookup stops waiting for its slot once `promotion` is set.
+pub async fn resolve(
+    ytdlp: &str,
+    ids: &[String],
+    high_quality: bool,
+    lane: Lane,
+    promotion: Arc<Promotion>,
+) -> Vec<(String, Result<Stream, String>)> {
     let all_failed = |e: String| ids.iter().map(|id| (id.clone(), Err(e.clone()))).collect();
     let queued = Instant::now();
-    let _permit = match lane {
+    let slots = match lane {
         Lane::Now => None,
-        Lane::Ahead => match AHEAD.acquire().await {
-            Ok(p) => Some(p),
-            Err(e) => return all_failed(e.to_string()),
-        },
-        Lane::Speculative => {
-            let permit = match SPECULATIVE.acquire().await {
-                Ok(p) => p,
-                Err(e) => return all_failed(e.to_string()),
-            };
-            if queued.elapsed() > STALE_HINT {
-                return all_failed("hint dropped (waited too long)".into());
-            }
-            Some(permit)
-        }
+        Lane::Ahead => Some(&AHEAD),
+        Lane::Speculative => Some(&SPECULATIVE),
     };
+    let _permit = match slots {
+        None => None,
+        Some(_) if promotion.is_set() => None,
+        Some(slots) => tokio::select! {
+            permit = slots.acquire() => match permit {
+                Ok(p) => Some(p),
+                Err(e) => return all_failed(e.to_string()),
+            },
+            _ = promotion.notify.notified() => None,
+        },
+    };
+    if _permit.is_none() && lane != Lane::Now {
+        log::debug!("lookup of {} promoted: the track is wanted now", ids.join(", "));
+    }
+    if lane == Lane::Speculative && queued.elapsed() > STALE_HINT && !promotion.is_set() {
+        return all_failed("hint dropped (waited too long)".into());
+    }
     // Prefer the exact itag `quick` uses, so its bytes and ours are the same file.
     let format = if high_quality {
         "251/bestaudio[acodec=opus]/bestaudio"

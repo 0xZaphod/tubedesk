@@ -3,6 +3,7 @@
 use gstreamer as gst;
 use gst::prelude::*;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Loudest the app ever plays: 50% of full scale (−6 dB).
@@ -25,6 +26,8 @@ pub enum PlayerCmd {
     Stop,
     Seek(f64),
     Volume(f64),
+    /// Internal: a bus message arrived, handle it now (not at the next tick).
+    Wake,
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +58,10 @@ impl Player {
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         std::thread::Builder::new()
             .name("player".into())
-            .spawn(move || run(rx, volume, on_event, ready_tx))
+            .spawn({
+                let wake = tx.clone();
+                move || run(rx, wake, volume, on_event, ready_tx)
+            })
             .map_err(|e| e.to_string())?;
         ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Self { tx })
@@ -64,6 +70,7 @@ impl Player {
 
 fn run(
     rx: Receiver<PlayerCmd>,
+    wake: Sender<PlayerCmd>,
     volume: f64,
     on_event: impl Fn(PlayerEvent),
     ready: Sender<Result<(), String>>,
@@ -86,6 +93,16 @@ fn run(
         }
     }
     let bus = playbin.bus().expect("playbin has a bus");
+    // Wake the loop as soon as something it acts on is posted (end of track,
+    // error, preroll done), instead of up to 250 ms later.
+    let wake = Mutex::new(wake);
+    bus.set_sync_handler(move |_, msg| {
+        use gst::MessageView;
+        if matches!(msg.view(), MessageView::Eos(..) | MessageView::Error(..) | MessageView::AsyncDone(..)) {
+            let _ = wake.lock().unwrap().send(PlayerCmd::Wake);
+        }
+        gst::BusSyncReply::Pass
+    });
     let _ = ready.send(Ok(()));
 
     let mut want_playing = false;
@@ -235,5 +252,6 @@ fn handle(playbin: &gst::Element, cmd: PlayerCmd, want_playing: &mut bool) {
             let _ = playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, t);
         }
         PlayerCmd::Volume(v) => playbin.set_property("volume", gain(v)),
+        PlayerCmd::Wake => {}
     }
 }

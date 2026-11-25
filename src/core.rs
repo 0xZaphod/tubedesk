@@ -4,12 +4,13 @@
 use crate::media::MediaState;
 use crate::player::{Player, PlayerCmd, PlayerEvent};
 use crate::proxy::StreamProxy;
-use crate::resolver::{self, Lane, Stream};
+use crate::resolver::{self, Lane, Promotion, Stream};
 use rustypipe::client::RustyPipe;
 use rustypipe::model::TrackItem;
 use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::Sender as StdSender;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -133,6 +134,8 @@ struct Lookup {
     /// One of them is a foreground lookup (the track the user waits for).
     foreground: bool,
     running: u32,
+    /// Lets the background lookup skip its queue (see `request_now`).
+    promotion: Option<Arc<Promotion>>,
 }
 
 /// [`Session`] as written (borrowing the queue instead of copying it).
@@ -252,6 +255,11 @@ impl Core {
 
     fn handle(&mut self, msg: CoreMsg) {
         match msg {
+            CoreMsg::PlayTracks { tracks, .. } | CoreMsg::PlayShuffled(tracks) | CoreMsg::PlayList { tracks, .. }
+                if tracks.is_empty() =>
+            {
+                log::debug!("nothing to play; keeping the queue");
+            }
             CoreMsg::PlayTracks { tracks, start } => {
                 self.queue = tracks;
                 self.radio_requested_for = None;
@@ -299,7 +307,9 @@ impl Core {
                     Some(cur) if i < cur => self.index = Some(cur - 1),
                     Some(cur) if i == cur => {
                         if cur < self.queue.len() {
-                            self.start_at(cur);
+                            // The next track takes its place, paused if it was.
+                            let play = self.now.playing;
+                            self.start_at_from(cur, None, play);
                         } else {
                             self.stop();
                         }
@@ -307,6 +317,9 @@ impl Core {
                     _ => {}
                 }
                 self.emit_queue();
+                if let Some(i) = self.index {
+                    self.prefetch_ahead(i); // the next two may have changed
+                }
             }
             CoreMsg::Remove(_) => {}
             CoreMsg::Move { from, to } if from < self.queue.len() && to < self.queue.len() && from != to => {
@@ -541,18 +554,20 @@ impl Core {
         self.awaiting = None;
         self.player.send(PlayerCmd::Stop);
         self.index = None;
+        self.proxy.set_upcoming(Vec::new());
         self.now = NowPlaying { volume: self.now.volume, ..Default::default() };
         self.emit_state();
         self.emit_index();
     }
 
     fn start_at(&mut self, i: usize) {
-        self.start_at_from(i, None);
+        self.start_at_from(i, None, true);
     }
 
     /// Starts track `i`, optionally from position `from` (resume): the player
     /// then seeks before it starts playing, so the beginning is never heard.
-    fn start_at_from(&mut self, i: usize, from: Option<f64>) {
+    /// `play` false loads it paused.
+    fn start_at_from(&mut self, i: usize, from: Option<f64>, play: bool) {
         self.restored = false;
         self.pending_seek = from;
         let Some(track) = self.queue.get(i).cloned() else { return };
@@ -569,7 +584,7 @@ impl Core {
             track: Some(track.clone()),
             index: Some(i),
             loading: true,
-            playing: true,
+            playing: play,
             // Resuming: show the saved position right away, not 0:00.
             position: from.unwrap_or(0.0),
             volume: self.now.volume,
@@ -671,12 +686,15 @@ impl Core {
 
     fn load_uri(&mut self, uri: String) {
         self.awaiting = None;
-        self.player.send(match self.pending_seek.take() {
-            Some(pos) => PlayerCmd::LoadAt(uri, pos),
-            None => PlayerCmd::Load(uri),
+        // Paused (while loading, or loaded paused): preroll paused via LoadAt,
+        // so not even the first moment is heard.
+        self.player.send(match (self.pending_seek.take(), self.now.playing) {
+            (Some(pos), _) => PlayerCmd::LoadAt(uri, pos),
+            (None, false) => PlayerCmd::LoadAt(uri, 0.0),
+            (None, true) => PlayerCmd::Load(uri),
         });
         if !self.now.playing {
-            self.player.send(PlayerCmd::Pause); // paused while it was loading
+            self.player.send(PlayerCmd::Pause);
         }
     }
 
@@ -707,6 +725,7 @@ impl Core {
     /// Prepares the two tracks after `i`, so playing on or skipping once is instant.
     /// Both missing ones are looked up in one yt-dlp run.
     fn prefetch_ahead(&mut self, i: usize) {
+        self.proxy.set_upcoming(self.upcoming());
         let mut missing = Vec::new();
         for k in [i + 1, i + 2] {
             let Some(id) = self.queue.get(k).map(|t| t.id.clone()) else { continue };
@@ -746,26 +765,37 @@ impl Core {
     }
 
     /// Starts a lookup for the track the user is waiting for, bypassing the
-    /// background queue. If the same id is still queued or running as a
-    /// background lookup, a foreground one is started anyway; whichever
-    /// finishes first plays.
+    /// background queue. A background lookup of the same id already in
+    /// flight is promoted (it skips its queue) instead of starting a second
+    /// yt-dlp run; the quick URL covers the start meanwhile.
     fn request_now(&mut self, id: &str) {
-        if self.inflight.get(id).is_some_and(|l| l.foreground) {
-            return;
+        match self.inflight.get_mut(id) {
+            Some(l) if l.foreground => {}
+            Some(l) => {
+                log::debug!("{id}: already being looked up; promoting that lookup");
+                l.foreground = true;
+                if let Some(p) = &l.promotion {
+                    p.promote();
+                }
+            }
+            None => self.spawn_resolve(vec![id.to_string()], Lane::Now),
         }
-        self.spawn_resolve(vec![id.to_string()], Lane::Now);
     }
 
     /// Looks up `ids` in one yt-dlp run; each sends its own `Resolved`.
     fn spawn_resolve(&mut self, ids: Vec<String>, lane: Lane) {
+        let promotion = Arc::new(Promotion::default());
         for id in &ids {
             let lookup = self.inflight.entry(id.clone()).or_default();
             lookup.running += 1;
             lookup.foreground |= lane == Lane::Now;
+            if lane != Lane::Now {
+                lookup.promotion = Some(promotion.clone());
+            }
         }
         let (me, ytdlp, hq) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality);
         tauri::async_runtime::spawn(async move {
-            for (id, result) in resolver::resolve(&ytdlp, &ids, hq, lane).await {
+            for (id, result) in resolver::resolve(&ytdlp, &ids, hq, lane, promotion).await {
                 me.send(CoreMsg::Resolved { id, result });
             }
         });
@@ -774,9 +804,13 @@ impl Core {
     /// Whether `id`'s start is worth downloading ahead: one of the next two
     /// tracks, or the restored track that Play will resume.
     fn should_warm(&self, id: &str) -> bool {
-        let Some(i) = self.index else { return false };
+        self.upcoming().iter().any(|u| u == id)
+    }
+
+    fn upcoming(&self) -> Vec<String> {
+        let Some(i) = self.index else { return Vec::new() };
         let first = if self.restored { i } else { i + 1 };
-        self.queue.iter().skip(first).take(i + 3 - first).any(|t| t.id == id)
+        self.queue.iter().skip(first).take(i + 3 - first).map(|t| t.id.clone()).collect()
     }
 
     fn warm(&self, id: &str) {
@@ -876,6 +910,6 @@ impl Core {
     fn resume(&mut self) {
         self.restored = false;
         let (Some(i), pos) = (self.index, self.now.position) else { return };
-        self.start_at_from(i, (pos > 1.0).then_some(pos));
+        self.start_at_from(i, (pos > 1.0).then_some(pos), true);
     }
 }

@@ -17,7 +17,7 @@
 //! background and kept in memory, so they start instantly when played.
 
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,6 +35,11 @@ pub const QUICK_LIMIT: u64 = 450_000;
 const FULL_WARMUP: Duration = Duration::from_millis(3500);
 /// How long a request past the quick part waits for the full URL to arrive.
 const FULL_WAIT: Duration = Duration::from_secs(30);
+/// Upstream errors in a row (connection drops mid-chunk) before giving up.
+const NET_ERRORS: u32 = 4;
+/// A stalled upstream read errors out (and is retried) after this long.
+/// Only runs while a read is pending, so a paused stream doesn't trip it.
+const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// A full URL this close to its expiry is replaced before the next chunk.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 
@@ -65,6 +70,8 @@ struct Streams {
     map: HashMap<String, Upstream>,
     /// Registration order, oldest first, for eviction.
     order: Vec<String>,
+    /// Streams worth warming now (the next tracks), set by the core.
+    upcoming: HashSet<String>,
 }
 
 impl Streams {
@@ -97,6 +104,7 @@ impl StreamProxy {
             refresh: Arc::default(),
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
+                .read_timeout(READ_TIMEOUT)
                 .build()
                 .expect("http client"),
         };
@@ -199,6 +207,12 @@ impl StreamProxy {
         self.local_url(id)
     }
 
+    /// The streams worth warming now; a warm whose stream left this set
+    /// while it waited out the warm-up is dropped.
+    pub fn set_upcoming(&self, ids: Vec<String>) {
+        self.streams.lock().unwrap().upcoming = ids.into_iter().collect();
+    }
+
     /// Forgets a stream (e.g. its full URL could not be resolved), so
     /// requests waiting for its full URL give up right away.
     pub fn forget(&self, id: &str) {
@@ -223,6 +237,15 @@ impl StreamProxy {
         };
         // A fresh URL is refused at first: wait instead of retrying into 403s.
         tokio::time::sleep(FULL_WARMUP.saturating_sub(full.registered.elapsed())).await;
+        {
+            let mut st = self.streams.lock().unwrap();
+            if !st.upcoming.contains(id) {
+                if let Some(u) = st.map.get_mut(id) {
+                    u.warming = false;
+                }
+                return log::debug!("not warming {id}: no longer upcoming");
+            }
+        }
         let end = (CHUNK - 1).min(size - 1);
         let url = format!("{}&range=0-{end}", full.url);
         let bytes = match self.fetch(&full.headers, &url, RETRIES).await {
@@ -251,7 +274,16 @@ impl StreamProxy {
             for (k, v) in headers {
                 req = req.header(k, v);
             }
-            let resp = req.send().await.map_err(std::io::Error::other)?;
+            let resp = match req.send().await {
+                Ok(r) => r,
+                // A brief network problem: try again like a refusal.
+                Err(e) if attempt + 1 < retries => {
+                    log::debug!("upstream request failed ({e}), retrying ({})", attempt + 1);
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                Err(e) => return Err(std::io::Error::other(e)),
+            };
             let status = resp.status();
             if status.is_success() {
                 return Ok(Some(resp));
@@ -356,6 +388,7 @@ impl StreamProxy {
 
         let mut pos = start;
         let mut refreshed = false;
+        let mut net_errors = 0;
         while pos <= end {
             // Re-read each round: the full URL or a warmed head may arrive meanwhile.
             let Some(up) = self.streams.lock().unwrap().map.get(&id).cloned() else { return Ok(()) };
@@ -378,19 +411,19 @@ impl StreamProxy {
                     let chunk_end = (QUICK_LIMIT - 1).min(end);
                     log::debug!("upstream {id}: bytes {pos}-{chunk_end} (quick)");
                     let url = format!("{quick}&range={pos}-{chunk_end}");
-                    match self.fetch(&[], &url, 1).await? {
-                        Some(resp) => {
-                            let mut body = resp.bytes_stream();
-                            while let Some(bytes) = body.next().await {
-                                let bytes = bytes.map_err(std::io::Error::other)?;
-                                sock.write_all(&bytes).await?;
-                                pos += bytes.len() as u64;
+                    match self.fetch(&[], &url, 1).await {
+                        Ok(Some(resp)) => match pipe(&mut sock, resp, &mut pos).await? {
+                            // Dropped mid-way: go on from `pos` with the full URL.
+                            Some(e) => {
+                                log::debug!("{id}: quick URL failed at {pos} ({e}); using the full URL");
+                                if let Some(u) = self.streams.lock().unwrap().map.get_mut(&id) {
+                                    u.quick = None;
+                                }
                             }
-                            if pos <= chunk_end {
-                                return Ok(()); // upstream ended early
-                            }
-                        }
-                        None => {
+                            None if pos <= chunk_end => return Ok(()), // upstream ended early
+                            None => {}
+                        },
+                        Ok(None) | Err(_) => {
                             log::debug!("{id}: quick URL refused at {pos}; using the full URL");
                             if let Some(u) = self.streams.lock().unwrap().map.get_mut(&id) {
                                 u.quick = None;
@@ -429,16 +462,39 @@ impl StreamProxy {
                 }
                 return Ok(());
             };
-            let mut body = resp.bytes_stream();
-            while let Some(bytes) = body.next().await {
-                let bytes = bytes.map_err(std::io::Error::other)?;
-                sock.write_all(&bytes).await?; // errors when GStreamer seeks away; that's fine
-                pos += bytes.len() as u64;
+            // Socket errors (GStreamer seeked away or stopped) end the connection.
+            if let Some(e) = pipe(&mut sock, resp, &mut pos).await? {
+                net_errors += 1;
+                if net_errors >= NET_ERRORS {
+                    log::warn!("{id}: upstream keeps failing at byte {pos}: {e}");
+                    return Ok(());
+                }
+                log::debug!("{id}: upstream failed at byte {pos} ({e}); retrying from there");
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
             }
             if pos <= chunk_end {
                 return Ok(()); // upstream ended early
             }
+            net_errors = 0;
         }
         Ok(())
     }
+}
+
+/// Copies an upstream body to the socket, advancing `pos`. A socket error is
+/// returned as `Err` (end the connection); an upstream error mid-body as
+/// `Ok(Some(_))`, so the caller can continue from `pos`.
+async fn pipe(sock: &mut TcpStream, resp: reqwest::Response, pos: &mut u64) -> std::io::Result<Option<reqwest::Error>> {
+    let mut body = resp.bytes_stream();
+    while let Some(bytes) = body.next().await {
+        match bytes {
+            Ok(b) => {
+                sock.write_all(&b).await?;
+                *pos += b.len() as u64;
+            }
+            Err(e) => return Ok(Some(e)),
+        }
+    }
+    Ok(None)
 }

@@ -34,8 +34,10 @@ pub enum CoreMsg {
     /// More tracks of the list that was started with `anchor` as first track
     /// (ignored if something else has been started since).
     Extend { anchor: String, tracks: Vec<TrackItem> },
-    /// Prepare a track the user is likely to play next (e.g. hovered).
-    Prefetch(String),
+    /// Prepare a track the user is likely to play next. `priority`: a likely
+    /// pick (a list's first track), never dropped; otherwise a speculative
+    /// hint (hover), dropped while several lookups are running.
+    Prefetch { id: String, priority: bool },
     Clear,
     Control(Control),
     SeekBy(f64),
@@ -239,9 +241,13 @@ impl Core {
                     }
                 }
             }
-            CoreMsg::Prefetch(id) => {
+            CoreMsg::Prefetch { id, priority } => {
                 if !self.streams.get(&id).is_some_and(|s| s.is_fresh()) {
-                    self.request_background(&id);
+                    if priority {
+                        self.request(&id);
+                    } else {
+                        self.request_background(&id);
+                    }
                 }
             }
             CoreMsg::Clear => {

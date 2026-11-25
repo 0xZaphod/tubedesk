@@ -19,6 +19,8 @@ loaded, there are no ads to block.
 - Remembers the queue, the last song and its position; restored paused at start
   and resumed with Play (`~/.local/share/dev.tubedesk.app/session.json`)
 - Play / Shuffle buttons on playlist, album and mix cards; collapsible sidebar
+- **Pins**: pin songs, playlists, albums and mixes; they appear first on Home
+  (stored locally in `~/.local/share/dev.tubedesk.app/pins.json`)
 - MPRIS media controls (media keys and desktop widgets), tray menu
 - Optional hide-on-close: music keeps playing with the window hidden
 

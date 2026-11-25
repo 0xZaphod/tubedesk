@@ -139,6 +139,68 @@ function artistLinks(artists) {
   return out;
 }
 
+// ---- pins ------------------------------------------------------------------------
+// Your own pinned songs, playlists, albums and mixes, shown first on Home.
+
+const pinKey = (kind, id) => `${kind}:${id}`;
+const pinned = new Map(); // key → item (same shape as a home item)
+
+function svgIcon(d, cls) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('class', cls);
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', d);
+  svg.append(path);
+  return svg;
+}
+const PIN_PATH = 'M9 3h6l-1 6 4 3v2h-5v7l-1 1-1-1v-7H6v-2l4-3z';
+
+const trackPinItem = (t) => ({
+  kind: 'track', id: t.id, title: t.name,
+  subtitle: (t.artists || []).map((a) => a.name).join(', '),
+  thumbnails: t.cover || [], track: t,
+});
+
+function setPins(list) {
+  pinned.clear();
+  for (const p of list) pinned.set(pinKey(p.kind, p.id), p);
+  for (const b of document.querySelectorAll('[data-pin]')) {
+    const on = pinned.has(b.dataset.pin);
+    b.classList.toggle('pinned', on);
+    b.title = on ? 'Unpin' : 'Pin';
+  }
+  const slot = $('pinned-slot');
+  if (slot) renderPinned(slot);
+}
+
+async function togglePin(item) {
+  const on = pinned.has(pinKey(item.kind, item.id));
+  const list = on ? await call('unpin', { kind: item.kind, id: item.id }) : await call('pin', { item });
+  setPins(list);
+  toast(on ? `Unpinned ${item.title}` : `Pinned ${item.title}`);
+}
+
+function pinButton(item, cls) {
+  const key = pinKey(item.kind, item.id);
+  const on = pinned.has(key);
+  return h('button', {
+    class: `pin-btn ${cls}${on ? ' pinned' : ''}`, 'data-pin': key, title: on ? 'Unpin' : 'Pin',
+    'aria-label': `Pin ${item.title}`,
+    onclick: (e) => { e.stopPropagation(); togglePin(item); },
+  }, svgIcon(PIN_PATH, 'pin-icon'));
+}
+
+function renderPinned(slot) {
+  const items = [...pinned.values()];
+  slot.replaceChildren(...(items.length
+    ? [h('section', { class: 'home-section' }, h('h2', { text: 'Pinned' }),
+        h('div', { class: 'shelf' }, items.map(homeCard).filter(Boolean)))]
+    : []));
+}
+
 // Hovering a song for a moment prepares its stream in the background, so a
 // click right after usually plays immediately.
 const hinted = new Set();
@@ -181,25 +243,39 @@ function trackList(tracks) {
       : ''),
     h('div', { class: 't-dur', text: t.duration ? fmt(t.duration) : '' }),
     h('div', { class: 't-actions' },
+      pinButton(trackPinItem(t), 'row'),
       h('button', { class: 'text', title: 'Play next', text: 'Next', onclick: () => { call('enqueue', { tracks: [t], next: true }); toast('Playing next'); } }),
       h('button', { class: 'text', title: 'Add to queue', text: '+ Queue', onclick: () => { call('enqueue', { tracks: [t], next: false }); toast('Added to queue'); } }),
     ),
   )));
 }
 
+function shuffledCopy(tracks) {
+  const a = [...tracks];
+  for (let i = a.length - 1; i > 0; i--) { // Fisher–Yates
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// The shuffle order is decided when the page opens, and the first song of
+// both orders is prepared right away, so Play and Shuffle start instantly.
 function playButtons(tracks) {
   if (!tracks.length) return null;
-  const shuffled = () => {
-    const a = [...tracks];
-    for (let i = a.length - 1; i > 0; i--) { // Fisher–Yates
-      const j = Math.floor(Math.random() * (i + 1));
-      [a[i], a[j]] = [a[j], a[i]];
-    }
-    return a;
+  let order = shuffledCopy(tracks);
+  const prepare = () => {
+    invoke('prefetch', { id: tracks[0].id, priority: true });
+    invoke('prefetch', { id: order[0].id, priority: true });
   };
+  prepare();
   return h('div', { class: 'row-actions' },
     h('button', { class: 'btn', text: 'Play', onclick: () => call('play', { tracks, start: 0 }) }),
-    h('button', { class: 'btn secondary', text: 'Shuffle', onclick: () => call('play', { tracks: shuffled(), start: 0 }) }),
+    h('button', { class: 'btn secondary', text: 'Shuffle', onclick: () => {
+      call('play', { tracks: order, start: 0 });
+      order = shuffledCopy(tracks); // next Shuffle gets a new order, prepared too
+      invoke('prefetch', { id: order[0].id, priority: true });
+    } }),
     h('button', { class: 'btn secondary', text: 'Add to queue', onclick: () => { call('enqueue', { tracks, next: false }); toast(`Added ${tracks.length} tracks`); } }),
   );
 }
@@ -207,7 +283,7 @@ function playButtons(tracks) {
 // A card is a div (not a <button>) so it can contain the Play/Shuffle buttons.
 //   list: { kind, id } → hover Play + Shuffle buttons that play the whole list
 //   playable: show a single ▶ hint (the card itself plays on click)
-function card(thumbs, title, sub, onclick, { round = false, list = null, playable = false, trackId = null } = {}) {
+function card(thumbs, title, sub, onclick, { round = false, list = null, playable = false, trackId = null, pin = null } = {}) {
   const act = (shuffle) => (e) => {
     e.stopPropagation();
     toast(shuffle ? `Shuffling ${title}…` : `Playing ${title}…`);
@@ -221,16 +297,23 @@ function card(thumbs, title, sub, onclick, { round = false, list = null, playabl
     onkeydown: (e) => { if (e.key === 'Enter') onclick(); },
   },
     h('div', { class: 'thumb' }, img(thumbs),
+      pin && pinButton(pin, 'card'),
       list && h('div', { class: 'card-actions' },
         h('button', { class: 'card-btn', title: 'Play', 'aria-label': `Play ${title}`, text: '▶', onclick: act(false) }),
         h('button', { class: 'card-btn', title: 'Shuffle', 'aria-label': `Shuffle ${title}`, text: '⤮', onclick: act(true) }))),
     h('div', { class: 'ellipsis', text: title }),
     h('div', { class: 'muted ellipsis', text: sub || '' }));
 }
-const albumCard = (a) => card(a.cover, a.name, [a.year, (a.artists || []).map((x) => x.name).join(', ')].filter(Boolean).join(' · '),
-  () => navigate({ name: 'album', id: a.id }), { list: { kind: 'album', id: a.id } });
-const playlistCard = (p) => card(p.thumbnail, p.name, [p.channel && p.channel.name, p.track_count && `${p.track_count} tracks`].filter(Boolean).join(' · '),
-  () => navigate({ name: 'playlist', id: p.id }), { list: { kind: 'playlist', id: p.id } });
+const albumCard = (a) => {
+  const sub = [a.year, (a.artists || []).map((x) => x.name).join(', ')].filter(Boolean).join(' · ');
+  return card(a.cover, a.name, sub, () => navigate({ name: 'album', id: a.id }),
+    { list: { kind: 'album', id: a.id }, pin: { kind: 'album', id: a.id, title: a.name, subtitle: sub, thumbnails: a.cover, track: null } });
+};
+const playlistCard = (p) => {
+  const sub = [p.channel && p.channel.name, p.track_count && `${p.track_count} tracks`].filter(Boolean).join(' · ');
+  return card(p.thumbnail, p.name, sub, () => navigate({ name: 'playlist', id: p.id, title: p.name, thumbs: p.thumbnail }),
+    { list: { kind: 'playlist', id: p.id }, pin: { kind: 'playlist', id: p.id, title: p.name, subtitle: sub, thumbnails: p.thumbnail, track: null } });
+};
 const artistCard = (a) => card(a.avatar, a.name, 'Artist', () => navigate({ name: 'artist', id: a.id }), { round: true });
 
 function detailHead(thumbs, title, sub) {
@@ -248,13 +331,13 @@ function needLogin() {
 function homeCard(item) {
   const { thumbnails: th, title, subtitle: sub, id } = item;
   switch (item.kind) {
-  case 'playlist': return card(th, title, sub, () => navigate({ name: 'playlist', id, title, thumbs: th }), { list: { kind: 'playlist', id } });
-  case 'album': return card(th, title, sub, () => navigate({ name: 'album', id }), { list: { kind: 'album', id } });
+  case 'playlist': return card(th, title, sub, () => navigate({ name: 'playlist', id, title, thumbs: th }), { list: { kind: 'playlist', id }, pin: item });
+  case 'album': return card(th, title, sub, () => navigate({ name: 'album', id }), { list: { kind: 'album', id }, pin: item });
   case 'artist': return card(th, title, sub, () => navigate({ name: 'artist', id }), { round: true });
   case 'mix': return card(th, title, sub, () => { toast(`Playing ${title}…`); call('play_list', { kind: 'mix', id, shuffle: false }); },
-    { list: { kind: 'mix', id } });
+    { list: { kind: 'mix', id }, pin: item });
   case 'track': return item.track
-    ? card(th, title, sub, () => call('play', { tracks: [item.track], start: 0 }), { playable: true, trackId: id })
+    ? card(th, title, sub, () => call('play', { tracks: [item.track], start: 0 }), { playable: true, trackId: id, pin: item })
     : null;
   default: return null;
   }
@@ -272,9 +355,12 @@ function homeSection(s) {
 async function renderHome(token, show) {
   const header = [h('h1', { text: 'Home' })];
   if (!state.loggedIn) {
-    header.push(h('div', { class: 'muted' }, 'Sign in for your pinned items, mixes and personal recommendations. ',
+    header.push(h('div', { class: 'muted' }, 'Sign in for your mixes and personal recommendations. ',
       h('span', { class: 'link', text: 'Sign in', onclick: () => navigate({ name: 'account' }) })));
   }
+  const slot = h('div', { id: 'pinned-slot' });
+  renderPinned(slot);
+  header.push(slot);
   const stale = () => token !== renderToken;
 
   const cached = await invoke('home_cached').catch(() => []);
@@ -480,6 +566,7 @@ function applyAuth(a) {
   await listen('queue', (e) => applyQueue(e.payload));
   await listen('auth', (e) => applyAuth(e.payload));
   invoke('sync');
+  try { setPins(await invoke('pins')); } catch (e) { /* none yet */ }
   try { applyAuth(await invoke('auth_status')); } catch (e) { /* ignore */ }
   navigate({ name: 'home' });
 })();

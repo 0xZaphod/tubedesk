@@ -31,6 +31,9 @@ struct App {
     home_cache_path: std::path::PathBuf,
     /// Lists prepared on hover, keyed by "kind:id".
     prepared: Mutex<std::collections::HashMap<String, ListStart>>,
+    pins_path: std::path::PathBuf,
+    /// Serialises read-modify-write of the pins file.
+    pins_lock: Mutex<()>,
 }
 
 impl App {
@@ -321,8 +324,8 @@ async fn prepare_list(app: State<'_, App>, kind: String, id: String) -> Res<()> 
         return Ok(());
     }
     let start = list_start(&app.q(), &kind, &id).await?;
-    app.core.send(CoreMsg::Prefetch(start.tracks[0].id.clone()));
-    app.core.send(CoreMsg::Prefetch(start.shuffled[0].id.clone()));
+    app.core.send(CoreMsg::Prefetch { id: start.tracks[0].id.clone(), priority: true });
+    app.core.send(CoreMsg::Prefetch { id: start.shuffled[0].id.clone(), priority: true });
     let mut prepared = app.prepared.lock().unwrap();
     prepared.retain(|_, p| p.loaded.elapsed() < PREPARED_TTL);
     prepared.insert(key, start);
@@ -381,10 +384,48 @@ fn queue_remove(app: State<'_, App>, index: usize) {
     app.core.send(CoreMsg::Remove(index));
 }
 
-/// Hint that a track may be played soon (the UI calls this on hover).
+/// Hint that a track may be played soon: on hover (`priority` false) or as
+/// the first track of an opened list (`priority` true).
 #[tauri::command]
-fn prefetch(app: State<'_, App>, id: String) {
-    app.core.send(CoreMsg::Prefetch(id));
+fn prefetch(app: State<'_, App>, id: String, priority: Option<bool>) {
+    app.core.send(CoreMsg::Prefetch { id, priority: priority.unwrap_or(false) });
+}
+
+// ---- pins --------------------------------------------------------------------
+
+fn load_pins(app: &App) -> Vec<home::HomeItem> {
+    std::fs::read(&app.pins_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_pins(app: &App, pins: &[home::HomeItem]) -> Res<()> {
+    let json = serde_json::to_vec_pretty(pins).map_err(err)?;
+    std::fs::write(&app.pins_path, json).map_err(err)
+}
+
+/// Your own pinned songs, playlists, albums and mixes (stored locally).
+#[tauri::command]
+fn pins(app: State<'_, App>) -> Vec<home::HomeItem> {
+    load_pins(&app)
+}
+
+/// Pins an item at the front (re-pinning moves it there). Returns all pins.
+#[tauri::command]
+fn pin(app: State<'_, App>, item: home::HomeItem) -> Res<Vec<home::HomeItem>> {
+    let _guard = app.pins_lock.lock().unwrap();
+    let mut pins = load_pins(&app);
+    pins.retain(|p| !(p.kind == item.kind && p.id == item.id));
+    pins.insert(0, item);
+    save_pins(&app, &pins)?;
+    Ok(pins)
+}
+
+#[tauri::command]
+fn unpin(app: State<'_, App>, kind: String, id: String) -> Res<Vec<home::HomeItem>> {
+    let _guard = app.pins_lock.lock().unwrap();
+    let mut pins = load_pins(&app);
+    pins.retain(|p| !(p.kind == kind && p.id == id));
+    save_pins(&app, &pins)?;
+    Ok(pins)
 }
 
 #[tauri::command]
@@ -551,6 +592,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         home: Mutex::default(),
         home_cache_path: data_dir.join("home_cache.json"),
         prepared: Mutex::default(),
+        pins_path: data_dir.join("pins.json"),
+        pins_lock: Mutex::default(),
     });
     Ok(())
 }
@@ -562,7 +605,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,
-            play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, control, seek, set_volume, sync,
+            play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, control, seek, set_volume, sync,
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)

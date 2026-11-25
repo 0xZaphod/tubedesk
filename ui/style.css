@@ -154,6 +154,25 @@ h2 { font-size: 16px; margin: 18px 0 8px; }
 .shelf { display: grid; grid-auto-flow: column; grid-auto-columns: 160px; gap: 12px; overflow-x: auto; padding-bottom: 6px; }
 .home-section h2 { margin-top: 22px; }
 
+/* pins */
+.pin-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
+.pin-btn { display: inline-grid; place-items: center; color: var(--muted); }
+.pin-btn.pinned { color: var(--accent); }
+.pin-btn.pinned .pin-icon { fill: currentColor; }
+.pin-btn.row { width: 28px; height: 28px; border-radius: 6px; }
+.pin-btn.row:hover { background: var(--hover); color: var(--text); }
+.track .t-actions { align-items: center; }
+.track:has(.pin-btn.pinned) .t-actions { visibility: visible; }
+.track:has(.pin-btn.pinned) .t-actions > :not(.pin-btn) { visibility: hidden; }
+.track:hover .t-actions > * { visibility: visible; }
+.pin-btn.card {
+  position: absolute; left: 8px; top: 8px; width: 30px; height: 30px; border-radius: 50%;
+  background: var(--panel); color: var(--text); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  opacity: 0; transition: opacity .12s;
+}
+.card:hover .pin-btn.card, .pin-btn.card.pinned { opacity: 1; }
+.pin-btn.card.pinned { color: var(--accent); }
+
 .empty { color: var(--muted); padding: 30px 0; }
 .spinner { color: var(--muted); padding: 30px 0; }
 

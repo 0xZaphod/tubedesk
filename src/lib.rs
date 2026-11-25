@@ -44,21 +44,31 @@ pub fn signed_query(rp: &RustyPipe) -> rustypipe::client::RustyPipeQuery {
     if auth::has_session(rp) { q.authenticated() } else { q }
 }
 
-/// Tracks of a playlist. Personal mixes (`RDTMAK…`) are not readable as
-/// playlists, only as radios, so `RD…` ids fall back to the radio endpoint.
+/// Tracks of a playlist, trying in order:
+/// 1. signed in (private playlists, personalised data),
+/// 2. anonymous: rustypipe can't parse the signed-in page of playlists you
+///    *own* ("playlist without header"), but reads them fine anonymously,
+/// 3. as a radio: personal mixes (`RDTMAK…`) only exist as radios.
 async fn playlist_tracks(q: &rustypipe::client::RustyPipeQuery, id: &str) -> Res<(Option<rustypipe::model::MusicPlaylist>, Vec<TrackItem>)> {
-    match q.music_playlist(id).await {
-        Ok(mut p) => {
-            p.tracks.extend_limit(q, LIST_LIMIT).await.map_err(err)?;
-            let tracks = std::mem::take(&mut p.tracks.items);
-            Ok((Some(p), tracks))
+    let anon = q.clone().unauthenticated();
+    let mut last = String::new();
+    for (label, query) in [("signed-in", q), ("anonymous", &anon)] {
+        match query.music_playlist(id).await {
+            Ok(mut p) => {
+                p.tracks.extend_limit(query, LIST_LIMIT).await.map_err(err)?;
+                let tracks = std::mem::take(&mut p.tracks.items);
+                return Ok((Some(p), tracks));
+            }
+            Err(e) => {
+                log::debug!("{label} playlist {id} failed: {e}");
+                last = e.to_string();
+            }
         }
-        Err(e) if id.starts_with("RD") => {
-            log::debug!("{id} is not readable as a playlist ({e}); loading it as a radio");
-            Ok((None, q.music_radio(id).await.map_err(err)?.items))
-        }
-        Err(e) => Err(err(e)),
     }
+    if id.starts_with("RD") {
+        return Ok((None, q.music_radio(id).await.map_err(err)?.items));
+    }
+    Err(last)
 }
 
 /// Fisher–Yates shuffle with a time-seeded xorshift (no need for a crypto RNG).
@@ -184,12 +194,30 @@ async fn playlist(app: State<'_, App>, id: String) -> Res<serde_json::Value> {
 
 #[tauri::command]
 async fn album(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicAlbum> {
-    app.q().music_album(&id).await.map_err(err)
+    album_data(&app.q(), &id).await
+}
+
+/// Signed-in first, anonymous as fallback (see `playlist_tracks`).
+async fn album_data(q: &rustypipe::client::RustyPipeQuery, id: &str) -> Res<rustypipe::model::MusicAlbum> {
+    match q.music_album(id).await {
+        Ok(a) => Ok(a),
+        Err(e) => {
+            log::debug!("signed-in album {id} failed: {e}; retrying anonymously");
+            q.clone().unauthenticated().music_album(id).await.map_err(err)
+        }
+    }
 }
 
 #[tauri::command]
 async fn artist(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicArtist> {
-    app.q().music_artist(&id, false).await.map_err(err)
+    let q = app.q();
+    match q.music_artist(&id, false).await {
+        Ok(a) => Ok(a),
+        Err(e) => {
+            log::debug!("signed-in artist {id} failed: {e}; retrying anonymously");
+            q.unauthenticated().music_artist(&id, false).await.map_err(err)
+        }
+    }
 }
 
 /// The home page as it was last loaded (instant, possibly stale).
@@ -226,7 +254,7 @@ async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool)
     let mut tracks = match kind.as_str() {
         "playlist" => playlist_tracks(&q, &id).await?.1,
         "album" => {
-            let a = q.music_album(&id).await.map_err(err)?;
+            let a = album_data(&q, &id).await?;
             let cover = a.cover.clone();
             a.tracks
                 .into_iter()
@@ -269,6 +297,12 @@ fn queue_jump(app: State<'_, App>, index: usize) {
 #[tauri::command]
 fn queue_remove(app: State<'_, App>, index: usize) {
     app.core.send(CoreMsg::Remove(index));
+}
+
+/// Hint that a track may be played soon (the UI calls this on hover).
+#[tauri::command]
+fn prefetch(app: State<'_, App>, id: String) {
+    app.core.send(CoreMsg::Prefetch(id));
 }
 
 #[tauri::command]
@@ -445,7 +479,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,
-            play, play_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, control, seek, set_volume, sync,
+            play, play_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, control, seek, set_volume, sync,
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)

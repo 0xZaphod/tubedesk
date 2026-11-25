@@ -31,6 +31,8 @@ pub enum CoreMsg {
     JumpTo(usize),
     Remove(usize),
     Move { from: usize, to: usize },
+    /// Prepare a track the user is likely to play next (e.g. hovered).
+    Prefetch(String),
     Clear,
     Control(Control),
     SeekBy(f64),
@@ -224,6 +226,11 @@ impl Core {
                 }
             }
             CoreMsg::Move { .. } => {}
+            CoreMsg::Prefetch(id) => {
+                if !self.streams.get(&id).is_some_and(|s| s.is_fresh()) {
+                    self.request_background(&id);
+                }
+            }
             CoreMsg::Clear => {
                 self.queue.clear();
                 self.stop();
@@ -441,6 +448,14 @@ impl Core {
         }
     }
 
+    /// Like `request`, but dropped when several lookups are already running,
+    /// so speculative prefetches (hover) never pile up yt-dlp processes.
+    fn request_background(&mut self, id: &str) {
+        if self.inflight.len() < 4 {
+            self.request(id);
+        }
+    }
+
     /// Starts a yt-dlp lookup for `id` unless one is already running.
     fn request(&mut self, id: &str) {
         if !self.inflight.insert(id.to_string()) {
@@ -510,6 +525,10 @@ impl Core {
             ..Default::default()
         };
         // The UI isn't listening yet; it asks via Sync once loaded.
+        // Prepare the restored track and the next ones, so Play is instant.
+        let id = self.queue[i].id.clone();
+        self.request(&id);
+        self.prefetch_ahead(i);
     }
 
     /// Starts the restored track from where it was left.

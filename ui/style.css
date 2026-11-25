@@ -57,14 +57,18 @@ img { display: block; }
   border-right: 1px solid var(--border);
   min-height: 0; overflow-y: auto;
 }
-.brand { font-weight: 700; font-size: 16px; padding: 0 10px 14px; }
+.sidebar-head { display: flex; align-items: center; gap: 6px; padding: 0 0 12px; }
+.brand { font-weight: 700; font-size: 16px; white-space: nowrap; }
 .nav { text-align: left; padding: 7px 10px; border-radius: 7px; }
 .nav:hover { background: var(--hover); }
 .nav.active { background: var(--panel-2); font-weight: 600; }
 .nav-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 14px 10px 4px; }
 .spacer { flex: 1; }
-#app.sidebar-collapsed { grid-template-columns: 0 1fr auto; }
-#app.sidebar-collapsed #sidebar { visibility: hidden; padding: 0; border: 0; overflow: hidden; }
+/* Collapsed: a narrow rail that only keeps the toggle. */
+#app.sidebar-collapsed { grid-template-columns: 54px 1fr auto; }
+#app.sidebar-collapsed #sidebar { padding: 16px 10px; overflow: hidden; }
+#app.sidebar-collapsed #sidebar > :not(.sidebar-head),
+#app.sidebar-collapsed .brand { display: none; }
 
 /* main */
 #main { grid-area: main; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -198,7 +202,7 @@ input[type=range] { accent-color: var(--accent); }
 
 @media (max-width: 760px) {
   #app { grid-template-columns: 150px 1fr; grid-template-areas: "side main" "bar bar"; }
-  #app.sidebar-collapsed { grid-template-columns: 0 1fr; }
+  #app.sidebar-collapsed { grid-template-columns: 54px 1fr; }
   #queue { display: none; }
   #playerbar { grid-template-columns: minmax(0, 1fr) auto; }
   .extras { display: none; }

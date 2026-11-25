@@ -9,7 +9,10 @@
 <body>
   <div id="app">
     <nav id="sidebar">
-      <div class="brand">TubeDesk</div>
+      <div class="sidebar-head">
+        <button id="sidebar-toggle" class="icon" title="Hide sidebar" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true">☰</button>
+        <span class="brand">TubeDesk</span>
+      </div>
       <button class="nav" data-view="home">Home</button>
       <div class="nav-label">Library</div>
       <button class="nav" data-view="playlists">Playlists</button>
@@ -22,7 +25,6 @@
 
     <main id="main">
       <header id="topbar">
-        <button id="sidebar-toggle" class="icon" title="Hide sidebar" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true">☰</button>
         <form id="search-form">
           <input id="search-input" type="search" placeholder="Search songs, albums, artists" autocomplete="off">
         </form>

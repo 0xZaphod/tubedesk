@@ -139,12 +139,28 @@ function artistLinks(artists) {
   return out;
 }
 
+// Hovering a song for a moment prepares its stream in the background, so a
+// click right after usually plays immediately.
+const hinted = new Set();
+let hoverTimer = null;
+function hoverPrefetch(id) {
+  return {
+    onmouseenter: () => {
+      clearTimeout(hoverTimer);
+      if (!id || hinted.has(id)) return;
+      hoverTimer = setTimeout(() => { hinted.add(id); invoke('prefetch', { id }); }, 350);
+    },
+    onmouseleave: () => clearTimeout(hoverTimer),
+  };
+}
+
 function trackList(tracks) {
   if (!tracks.length) return h('div', { class: 'empty', text: 'No tracks.' });
   const playingId = state.now && state.now.track && state.now.track.id;
   return h('ol', { class: 'tracks' }, tracks.map((t, i) => h('li', {
     class: `track${t.id === playingId ? ' current' : ''}`,
     'data-id': t.id,
+    ...hoverPrefetch(t.id),
     // The title link plays on single click; double-clicking elsewhere on the row
     // plays too. Never both, or one double-click on the title would play 3 times.
     ondblclick: (e) => { if (!e.target.closest('.link, button')) call('play', { tracks, start: i }); },
@@ -185,7 +201,7 @@ function playButtons(tracks) {
 // A card is a div (not a <button>) so it can contain the Play/Shuffle buttons.
 //   list: { kind, id } → hover Play + Shuffle buttons that play the whole list
 //   playable: show a single ▶ hint (the card itself plays on click)
-function card(thumbs, title, sub, onclick, { round = false, list = null, playable = false } = {}) {
+function card(thumbs, title, sub, onclick, { round = false, list = null, playable = false, trackId = null } = {}) {
   const act = (shuffle) => (e) => {
     e.stopPropagation();
     toast(shuffle ? `Shuffling ${title}…` : `Playing ${title}…`);
@@ -194,6 +210,7 @@ function card(thumbs, title, sub, onclick, { round = false, list = null, playabl
   return h('div', {
     class: `card${round ? ' round' : ''}${playable ? ' playable' : ''}`,
     role: 'button', tabindex: '0', title,
+    ...(trackId ? hoverPrefetch(trackId) : {}),
     onclick,
     onkeydown: (e) => { if (e.key === 'Enter') onclick(); },
   },
@@ -231,7 +248,7 @@ function homeCard(item) {
   case 'mix': return card(th, title, sub, () => { toast(`Playing ${title}…`); call('play_list', { kind: 'mix', id, shuffle: false }); },
     { list: { kind: 'mix', id } });
   case 'track': return item.track
-    ? card(th, title, sub, () => call('play', { tracks: [item.track], start: 0 }), { playable: true })
+    ? card(th, title, sub, () => call('play', { tracks: [item.track], start: 0 }), { playable: true, trackId: id })
     : null;
   default: return null;
   }

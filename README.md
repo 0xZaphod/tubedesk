@@ -1,138 +1,59 @@
 # TubeDesk
 
-A lightweight, audio-only YouTube Music desktop client built with Tauri 2 / Rust.
-It doesn't wrap the YouTube Music site. The UI is its own, playback runs
-natively in Rust, and it downloads only audio streams. With no YouTube page
-loaded, there are no ads to block.
-
-## Features
-
-- **Home**: your personalised YouTube Music home (Listen again, Mixed for you,
-  Quick picks, recommendations, …); mixes play as radios
-- Search songs, albums, artists and playlists; artist, album and playlist pages
-- **Your YouTube Music library**: liked songs, saved playlists, albums,
-  artists and history (sign-in required)
-- Audio-only playback through GStreamer: Opus, best or smallest stream
-- Queue with play next, add to queue and remove. When the queue runs out it
-  continues with YouTube Music's radio for the last track.
-- Songs start in under a second even when nothing was prepared: the first
-  ~450 KB come from rustypipe's instantly usable URL while yt-dlp's full URL
-  is looked up and warms up, then the proxy switches over (same file, itag 251)
-- The next track is resolved in advance, so skipping is instant
-- Remembers the queue, the last song and its position; restored paused at start
-  and resumed with Play (`~/.local/share/dev.tubedesk.app/session.json`)
-- Play / Shuffle buttons on playlist, album and mix cards; collapsible sidebar
-- **Like / dislike / add to playlist** for the playing song, in the player bar
-  (writes to your YouTube Music account; sign-in required)
-- **Pins**: pin songs, playlists, albums and mixes; they appear first on Home
-  (stored locally in `~/.local/share/dev.tubedesk.app/pins.json`)
-- MPRIS media controls (media keys and desktop widgets), tray menu
-- Optional hide-on-close: music keeps playing with the window hidden
+A lightweight, audio-only YouTube Music desktop client built with Tauri 2 and
+Rust. It has its own UI and plays audio natively; it does not wrap the YouTube
+Music website.
 
 ## Requirements (Arch)
 
 ```sh
 sudo pacman -S webkit2gtk-4.1 libayatana-appindicator \
-  gstreamer gst-plugins-base gst-plugins-good gst-libav \
-  yt-dlp deno
+  gstreamer gst-plugins-base gst-plugins-good gst-libav yt-dlp deno
 ```
 
-`yt-dlp` resolves the audio streams, and `deno` lets it solve YouTube's
-JavaScript challenges. Keep yt-dlp up to date. When YouTube changes things,
-that's the part that breaks first.
+Keep `yt-dlp` up to date: it is the part that breaks when YouTube changes.
 
 ## Run
 
 ```sh
-cargo run
-RUST_LOG=tubedesk=debug cargo run                 # verbose logging
-cargo run -- --play "daft punk get lucky"         # search and play right away
-TUBEDESK_AUDIO_SINK="fakesink sync=true" cargo run -- --play "…"   # silent test
-cargo build --release
+cargo run                                   # RUST_LOG=tubedesk=debug for details
+./scripts/install-desktop-entry.sh          # taskbar icon / app menu entry (Wayland)
 ```
 
-Installable bundles: `cargo install tauri-cli --version "^2"` then `cargo tauri build`.
+Bundles (`.deb`, AppImage): `cargo install tauri-cli --version "^2"`, then
+`cargo tauri build`.
 
-## Desktop integration
+## Sign-in
 
-- Frameless window with a slim custom title bar (drag to move, double-click
-  to maximise, minimise / maximise / close on the right); the window edges
-  resize it.
-- `./scripts/install-desktop-entry.sh` installs a `.desktop` entry for the
-  local build so the taskbar shows the app icon (on Wayland the taskbar takes
-  the icon from the desktop file, not from the window).
-- The icon is rendered from the Fluent icon theme's `youtube-music.svg`. It is
-  YouTube's trademark: fine for personal use, replace it before publishing.
-
-## Signing in
-
-Under **Sign in** in the sidebar:
-
-1. **Sign in with Google** opens a private login window. Once Google
-   redirects back, the app copies the YouTube session cookies and closes the
-   window, so nothing else keeps using (and rotating) that session.
-2. **Import cookies.txt** is for when Google refuses to sign in inside the
-   app. Sign in at music.youtube.com in a *private/incognito* window of your
-   normal browser, export the youtube.com cookies in Netscape `cookies.txt`
-   format, **close that private window**, then import the file.
-
-The session cookie is stored by rustypipe in
-`~/.local/share/dev.tubedesk.app/rustypipe_cache.json` (the directory is
-`0700`). Treat it like a password. Signing out removes it.
+Use **Sign in** in the sidebar: either a private Google login window, or import
+a `cookies.txt` exported from a private browser window (close that window
+afterwards, YouTube rotates the session). The session is stored in
+`~/.local/share/dev.tubedesk.app/` (mode `0700`); treat it like a password.
 
 ## Configuration
 
-`~/.config/dev.tubedesk.app/config.json`:
-
-| key | default | |
-|---|---|---|
-| `high_quality` | `true` | best Opus stream (~130–160 kbps) vs the smallest |
-| `autoplay_radio` | `true` | continue with radio when the queue ends |
-| `volume` | `0.35` | volume slider position (perceptual curve, max −6 dB) |
-| `media_controls` | `true` | MPRIS / media keys |
-| `hide_on_close` | `false` | close button hides the window instead of quitting |
-| `login_user_agent` | `null` | user agent for the Google login window |
-| `ytdlp` | `"yt-dlp"` | yt-dlp executable |
+`~/.config/dev.tubedesk.app/config.json`: `high_quality`, `autoplay_radio`,
+`volume`, `media_controls`, `hide_on_close`, `login_user_agent`, `ytdlp`.
 
 ## How it works
 
-```
-ui/                   HTML/CSS/JS frontend (no build step)
-src/lib.rs            Tauri commands, tray, setup
-src/core.rs           queue, playback orchestration, radio, prefetch
-src/home.rs           home feed (FEmusic_home) parser
-src/player.rs         GStreamer playbin thread (audio only)
-src/resolver.rs       yt-dlp → audio stream URL + required headers
-src/proxy.rs          local 127.0.0.1 proxy GStreamer streams from
-src/auth.rs           login window / cookies.txt → rustypipe cookie auth
-src/media.rs          souvlaki MPRIS thread
-```
+- **Data** (search, pages, library, home feed) comes from
+  [rustypipe](https://codeberg.org/ThetaDev/rustypipe), YouTube Music's
+  internal API; likes and playlist edits use the same API's raw endpoints.
+- **Audio** is played by GStreamer through a local proxy (`src/proxy.rs`):
+  - Full stream URLs come from yt-dlp. YouTube rejects requests without a byte
+    range and refuses new URLs for ~3 s, so the proxy fetches ranged chunks
+    and retries.
+  - To start instantly, the first ~450 KB come from rustypipe's iOS URL for
+    the same file, which works immediately but only for that first part.
+  - Upcoming tracks are resolved and their start cached in advance.
+- `--play "<query>"` and `TUBEDESK_AUDIO_SINK="fakesink sync=true"` help with
+  testing.
 
-- **Metadata and library** come from [rustypipe](https://codeberg.org/ThetaDev/rustypipe)
-  (the YouTube Music internal API).
-- **Streams** come from yt-dlp. rustypipe's own stream URLs get cut off by
-  YouTube after about 1 MB without a PO token (that would need the separate
-  `rustypipe-botguard` binary).
-- **The proxy exists** because googlevideo.com refuses (403) requests without
-  a byte range, throttles big ones, and refuses brand-new URLs for about 2 s.
-  It fetches in 1 MiB ranged chunks with yt-dlp's headers, retries those early
-  403s, and honours GStreamer's `Range` requests for seeking.
-
-The UI only inserts remote text with `textContent`, and the CSP allows no
-remote scripts.
-
-The previous webview-wrapper version (music.youtube.com with uBO-style ad
-blocking) is tagged `wrapper-final`.
-
-## Known limitations / TODO
-
-- Startup of the *first* track takes ~5 s (yt-dlp, then YouTube's 2 s
-  warm-up). Later tracks are prefetched.
-- No liking or unliking and no playlist editing yet. rustypipe only reads the
-  library.
-- Google may refuse the embedded login window; use cookies.txt import.
-- Windows media controls need the window HWND (TODO in `src/media.rs`).
+The earlier webview-wrapper version is tagged `wrapper-final`.
 
 ## License
 
-GPL-3.0-or-later (rustypipe is GPL-3.0).
+GPL-3.0-or-later (rustypipe is GPL-3.0). The bundled icon is rendered from an
+icon theme's YouTube Music logo (YouTube's trademark): replace it before
+publishing.

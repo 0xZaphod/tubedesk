@@ -59,16 +59,22 @@ img { display: block; }
 }
 .sidebar-head { display: flex; align-items: center; gap: 6px; padding: 0 0 12px; }
 .brand { font-weight: 700; font-size: 16px; white-space: nowrap; }
-.nav { text-align: left; padding: 7px 10px; border-radius: 7px; }
+.nav { display: flex; align-items: center; gap: 10px; text-align: left; padding: 7px 10px; border-radius: 7px; white-space: nowrap; }
+.nav-icon {
+  width: 18px; height: 18px; flex: none;
+  fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
 .nav:hover { background: var(--hover); }
 .nav.active { background: var(--panel-2); font-weight: 600; }
 .nav-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 14px 10px 4px; }
 .spacer { flex: 1; }
-/* Collapsed: a narrow rail that only keeps the toggle. */
-#app.sidebar-collapsed { grid-template-columns: 54px 1fr auto; }
-#app.sidebar-collapsed #sidebar { padding: 16px 10px; overflow: hidden; }
-#app.sidebar-collapsed #sidebar > :not(.sidebar-head),
-#app.sidebar-collapsed .brand { display: none; }
+/* Collapsed: a narrow rail with the toggle and the navigation icons. */
+#app.sidebar-collapsed { grid-template-columns: 58px 1fr auto; }
+#app.sidebar-collapsed #sidebar { padding: 16px 8px; overflow: hidden; align-items: center; }
+#app.sidebar-collapsed .brand,
+#app.sidebar-collapsed .nav-label,
+#app.sidebar-collapsed .nav .label { display: none; }
+#app.sidebar-collapsed .nav { justify-content: center; padding: 9px; }
 
 /* main */
 #main { grid-area: main; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -202,7 +208,7 @@ input[type=range] { accent-color: var(--accent); }
 
 @media (max-width: 760px) {
   #app { grid-template-columns: 150px 1fr; grid-template-areas: "side main" "bar bar"; }
-  #app.sidebar-collapsed { grid-template-columns: 54px 1fr; }
+  #app.sidebar-collapsed { grid-template-columns: 58px 1fr; }
   #queue { display: none; }
   #playerbar { grid-template-columns: minmax(0, 1fr) auto; }
   .extras { display: none; }

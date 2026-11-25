@@ -31,6 +31,9 @@ pub enum CoreMsg {
     JumpTo(usize),
     Remove(usize),
     Move { from: usize, to: usize },
+    /// More tracks of the list that was started with `anchor` as first track
+    /// (ignored if something else has been started since).
+    Extend { anchor: String, tracks: Vec<TrackItem> },
     /// Prepare a track the user is likely to play next (e.g. hovered).
     Prefetch(String),
     Clear,
@@ -226,6 +229,16 @@ impl Core {
                 }
             }
             CoreMsg::Move { .. } => {}
+            CoreMsg::Extend { anchor, tracks } => {
+                if self.queue.first().is_some_and(|t| t.id == anchor) {
+                    log::info!("appended {} more tracks of the list", tracks.len());
+                    self.queue.extend(tracks);
+                    self.emit_queue();
+                    if let Some(i) = self.index {
+                        self.prefetch_ahead(i);
+                    }
+                }
+            }
             CoreMsg::Prefetch(id) => {
                 if !self.streams.get(&id).is_some_and(|s| s.is_fresh()) {
                     self.request_background(&id);

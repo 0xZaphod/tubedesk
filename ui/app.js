@@ -143,16 +143,22 @@ function artistLinks(artists) {
 // click right after usually plays immediately.
 const hinted = new Set();
 let hoverTimer = null;
-function hoverPrefetch(id) {
+function onHover(key, fire) {
   return {
     onmouseenter: () => {
       clearTimeout(hoverTimer);
-      if (!id || hinted.has(id)) return;
-      hoverTimer = setTimeout(() => { hinted.add(id); invoke('prefetch', { id }); }, 350);
+      if (hinted.has(key)) return;
+      hoverTimer = setTimeout(() => { hinted.add(key); fire(); }, 350);
     },
     onmouseleave: () => clearTimeout(hoverTimer),
   };
 }
+const hoverPrefetch = (id) => (id ? onHover(`t:${id}`, () => invoke('prefetch', { id })) : {});
+// Hovering a playlist/album/mix card loads its first page and warms the first
+// song of both its normal and its shuffled order.
+const hoverPrepare = (list) => onHover(`l:${list.kind}:${list.id}`, () => {
+  invoke('prepare_list', { kind: list.kind, id: list.id }).catch(() => hinted.delete(`l:${list.kind}:${list.id}`));
+});
 
 function trackList(tracks) {
   if (!tracks.length) return h('div', { class: 'empty', text: 'No tracks.' });
@@ -210,7 +216,7 @@ function card(thumbs, title, sub, onclick, { round = false, list = null, playabl
   return h('div', {
     class: `card${round ? ' round' : ''}${playable ? ' playable' : ''}`,
     role: 'button', tabindex: '0', title,
-    ...(trackId ? hoverPrefetch(trackId) : {}),
+    ...(trackId ? hoverPrefetch(trackId) : list ? hoverPrepare(list) : {}),
     onclick,
     onkeydown: (e) => { if (e.key === 'Enter') onclick(); },
   },
@@ -461,7 +467,8 @@ function applyQueue(q) {
 function applyAuth(a) {
   const changed = state.loggedIn !== a.logged_in;
   state.loggedIn = a.logged_in;
-  $('account-nav').textContent = a.logged_in ? 'Account ✓' : 'Sign in';
+  $('account-nav').querySelector('.label').textContent = a.logged_in ? 'Account' : 'Sign in';
+  $('account-nav').title = a.logged_in ? 'Account (signed in)' : 'Sign in';
   if (a.error) toast(a.error);
   if (changed && state.current) navigate(state.current);
 }

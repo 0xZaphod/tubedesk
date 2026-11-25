@@ -29,6 +29,8 @@ struct App {
     /// the next start can show them instantly.
     home: Mutex<Vec<home::HomeSection>>,
     home_cache_path: std::path::PathBuf,
+    /// Lists prepared on hover, keyed by "kind:id".
+    prepared: Mutex<std::collections::HashMap<String, ListStart>>,
 }
 
 impl App {
@@ -44,31 +46,90 @@ pub fn signed_query(rp: &RustyPipe) -> rustypipe::client::RustyPipeQuery {
     if auth::has_session(rp) { q.authenticated() } else { q }
 }
 
-/// Tracks of a playlist, trying in order:
-/// 1. signed in (private playlists, personalised data),
-/// 2. anonymous: rustypipe can't parse the signed-in page of playlists you
-///    *own* ("playlist without header"), but reads them fine anonymously,
+type Query = rustypipe::client::RustyPipeQuery;
+
+/// Loads a playlist's first page, trying in order:
+/// 1. anonymous: works for public/unlisted playlists, including your own
+///    (rustypipe can't parse the signed-in page of playlists you *own*),
+/// 2. signed in: private playlists,
 /// 3. as a radio: personal mixes (`RDTMAK…`) only exist as radios.
-async fn playlist_tracks(q: &rustypipe::client::RustyPipeQuery, id: &str) -> Res<(Option<rustypipe::model::MusicPlaylist>, Vec<TrackItem>)> {
-    let anon = q.clone().unauthenticated();
-    let mut last = String::new();
-    for (label, query) in [("signed-in", q), ("anonymous", &anon)] {
-        match query.music_playlist(id).await {
-            Ok(mut p) => {
-                p.tracks.extend_limit(query, LIST_LIMIT).await.map_err(err)?;
-                let tracks = std::mem::take(&mut p.tracks.items);
-                return Ok((Some(p), tracks));
-            }
-            Err(e) => {
-                log::debug!("{label} playlist {id} failed: {e}");
-                last = e.to_string();
+/// Returns the playlist (if any) and the query that worked, for paging on.
+async fn playlist_first_page(q: &Query, id: &str) -> Res<(Option<rustypipe::model::MusicPlaylist>, Vec<TrackItem>, Query)> {
+    if !id.starts_with("RDTMAK") {
+        let anon = q.clone().unauthenticated();
+        let mut last = String::new();
+        for (label, query) in [("anonymous", anon), ("signed-in", q.clone())] {
+            match query.music_playlist(id).await {
+                Ok(p) => {
+                    let tracks = p.tracks.items.clone();
+                    return Ok((Some(p), tracks, query));
+                }
+                Err(e) => {
+                    log::debug!("{label} playlist {id} failed: {e}");
+                    last = e.to_string();
+                }
             }
         }
+        if !id.starts_with("RD") {
+            return Err(last);
+        }
     }
-    if id.starts_with("RD") {
-        return Ok((None, q.music_radio(id).await.map_err(err)?.items));
+    Ok((None, q.music_radio(id).await.map_err(err)?.items, q.clone()))
+}
+
+/// All tracks of a playlist (up to LIST_LIMIT), for the playlist page.
+async fn playlist_tracks(q: &Query, id: &str) -> Res<(Option<rustypipe::model::MusicPlaylist>, Vec<TrackItem>)> {
+    let (mut meta, mut tracks, query) = playlist_first_page(q, id).await?;
+    if let Some(p) = meta.as_mut() {
+        p.tracks.extend_limit(&query, LIST_LIMIT).await.map_err(err)?;
+        tracks = std::mem::take(&mut p.tracks.items);
     }
-    Err(last)
+    Ok((meta, tracks))
+}
+
+/// The start of a playable list: enough to begin playback immediately, plus
+/// what is needed to load the remaining pages afterwards.
+#[derive(Clone)]
+struct ListStart {
+    tracks: Vec<TrackItem>,
+    /// The same first page in shuffled order, decided in advance so its first
+    /// track can be prefetched before Shuffle is clicked.
+    shuffled: Vec<TrackItem>,
+    rest: Option<(rustypipe::model::paginator::Paginator<TrackItem>, Query)>,
+    loaded: std::time::Instant,
+}
+
+async fn list_start(q: &Query, kind: &str, id: &str) -> Res<ListStart> {
+    let (tracks, rest) = match kind {
+        "playlist" => {
+            let (meta, tracks, query) = playlist_first_page(q, id).await?;
+            let rest = meta.filter(|p| !p.tracks.is_exhausted()).map(|p| (p.tracks, query));
+            (tracks, rest)
+        }
+        "album" => {
+            let a = album_data(q, id).await?;
+            let cover = a.cover.clone();
+            let tracks = a
+                .tracks
+                .into_iter()
+                .map(|mut t| {
+                    if t.cover.is_empty() {
+                        t.cover = cover.clone();
+                    }
+                    t
+                })
+                .collect();
+            (tracks, None)
+        }
+        "mix" => (q.music_radio(id).await.map_err(err)?.items, None),
+        other => return Err(format!("can't play a {other}")),
+    };
+    if tracks.is_empty() {
+        return Err("nothing to play".into());
+    }
+    let mut shuffled = tracks.clone();
+    shuffle(&mut shuffled);
+    Ok(ListStart { tracks, shuffled, rest, loaded: std::time::Instant::now() })
 }
 
 /// Fisher–Yates shuffle with a time-seeded xorshift (no need for a crypto RNG).
@@ -247,35 +308,56 @@ async fn home_page(app: State<'_, App>, token: Option<String>) -> Res<home::Home
 
 // ---- playback --------------------------------------------------------------
 
-/// Plays (optionally shuffled) a whole playlist, album or mix by id.
+/// Prepared list starts are reused for this long.
+const PREPARED_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Hint that a list may be played soon (the UI calls this on card hover):
+/// loads its first page and prefetches the first track of both the normal
+/// and the shuffled order, so Play and Shuffle start immediately.
+#[tauri::command]
+async fn prepare_list(app: State<'_, App>, kind: String, id: String) -> Res<()> {
+    let key = format!("{kind}:{id}");
+    if app.prepared.lock().unwrap().get(&key).is_some_and(|p| p.loaded.elapsed() < PREPARED_TTL) {
+        return Ok(());
+    }
+    let start = list_start(&app.q(), &kind, &id).await?;
+    app.core.send(CoreMsg::Prefetch(start.tracks[0].id.clone()));
+    app.core.send(CoreMsg::Prefetch(start.shuffled[0].id.clone()));
+    let mut prepared = app.prepared.lock().unwrap();
+    prepared.retain(|_, p| p.loaded.elapsed() < PREPARED_TTL);
+    prepared.insert(key, start);
+    Ok(())
+}
+
+/// Plays (optionally shuffled) a playlist, album or mix by id. Playback starts
+/// with the first page; further pages are appended in the background.
 #[tauri::command]
 async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool) -> Res<()> {
-    let q = app.q();
-    let mut tracks = match kind.as_str() {
-        "playlist" => playlist_tracks(&q, &id).await?.1,
-        "album" => {
-            let a = album_data(&q, &id).await?;
-            let cover = a.cover.clone();
-            a.tracks
-                .into_iter()
-                .map(|mut t| {
-                    if t.cover.is_empty() {
-                        t.cover = cover.clone();
-                    }
-                    t
-                })
-                .collect()
-        }
-        "mix" => q.music_radio(&id).await.map_err(err)?.items,
-        other => return Err(format!("can't play a {other}")),
+    let key = format!("{kind}:{id}");
+    let cached = app.prepared.lock().unwrap().remove(&key).filter(|p| p.loaded.elapsed() < PREPARED_TTL);
+    let start = match cached {
+        Some(s) => s,
+        None => list_start(&app.q(), &kind, &id).await?,
     };
-    if tracks.is_empty() {
-        return Err("nothing to play".into());
+    let first = if shuffle { start.shuffled } else { start.tracks };
+    let (anchor, first_len) = (first[0].id.clone(), first.len());
+    app.core.send(CoreMsg::PlayTracks { tracks: first, start: 0 });
+
+    if let Some((mut pages, query)) = start.rest {
+        let core = app.core.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = pages.extend_limit(&query, LIST_LIMIT).await {
+                log::warn!("loading the rest of {id} failed: {e}");
+            }
+            let mut rest: Vec<TrackItem> = pages.items.into_iter().skip(first_len).collect();
+            if shuffle {
+                crate::shuffle(&mut rest);
+            }
+            if !rest.is_empty() {
+                core.send(CoreMsg::Extend { anchor, tracks: rest });
+            }
+        });
     }
-    if shuffle {
-        crate::shuffle(&mut tracks);
-    }
-    app.core.send(CoreMsg::PlayTracks { tracks, start: 0 });
     Ok(())
 }
 
@@ -468,6 +550,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         config: Mutex::new(config),
         home: Mutex::default(),
         home_cache_path: data_dir.join("home_cache.json"),
+        prepared: Mutex::default(),
     });
     Ok(())
 }
@@ -479,7 +562,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,
-            play, play_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, control, seek, set_volume, sync,
+            play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, control, seek, set_volume, sync,
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)

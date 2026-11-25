@@ -7,6 +7,10 @@
 //! `http://127.0.0.1:<port>/s/<id>` instead, and this proxy fetches the
 //! upstream URL in ranged chunks (`&range=a-b`, like yt-dlp does). Seeking
 //! works because incoming `Range:` headers are honoured.
+//!
+//! Upcoming tracks are *warmed*: their first chunk is fetched in the
+//! background (waiting out YouTube's ~2 s 403 phase for new URLs) and kept in
+//! memory, so they start instantly when played.
 
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -17,6 +21,8 @@ use tokio::net::{TcpListener, TcpStream};
 const CHUNK: u64 = 1 << 20; // 1 MiB per upstream request
 const RETRIES: u32 = 12;
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Streams kept registered (current, prefetched, recently played).
+const MAX_STREAMS: usize = 10;
 
 #[derive(Clone)]
 struct Upstream {
@@ -24,12 +30,21 @@ struct Upstream {
     headers: Vec<(String, String)>,
     size: u64,
     mime: String,
+    /// First bytes of the stream, fetched ahead of time by [`StreamProxy::warm`].
+    head: Option<Arc<Vec<u8>>>,
+}
+
+#[derive(Default)]
+struct Streams {
+    map: HashMap<String, Upstream>,
+    /// Registration order, oldest first, for eviction.
+    order: Vec<String>,
 }
 
 #[derive(Clone)]
 pub struct StreamProxy {
     port: u16,
-    streams: Arc<Mutex<HashMap<String, Upstream>>>,
+    streams: Arc<Mutex<Streams>>,
     http: reqwest::Client,
 }
 
@@ -66,17 +81,47 @@ impl StreamProxy {
     }
 
     /// Registers an upstream stream and returns the local URL for GStreamer.
-    /// Only the most recent few streams are kept.
+    /// Re-registering the same URL keeps its warmed head. Only the most recent
+    /// [`MAX_STREAMS`] are kept.
     pub fn register(&self, id: &str, s: &crate::resolver::Stream) -> String {
-        let mut map = self.streams.lock().unwrap();
-        if map.len() > 8 {
-            map.clear();
+        let mut st = self.streams.lock().unwrap();
+        let same = st.map.get(id).is_some_and(|u| u.url == s.url);
+        if !same {
+            st.map.insert(
+                id.to_string(),
+                Upstream { url: s.url.clone(), headers: s.headers.clone(), size: s.size, mime: s.mime.clone(), head: None },
+            );
         }
-        map.insert(
-            id.to_string(),
-            Upstream { url: s.url.clone(), headers: s.headers.clone(), size: s.size, mime: s.mime.clone() },
-        );
+        st.order.retain(|x| x != id);
+        st.order.push(id.to_string());
+        while st.order.len() > MAX_STREAMS {
+            let old = st.order.remove(0);
+            st.map.remove(&old);
+        }
         format!("http://127.0.0.1:{}/s/{}", self.port, id)
+    }
+
+    /// Fetches and keeps the first chunk of a registered stream so that
+    /// playing it later starts immediately.
+    pub async fn warm(&self, id: &str) {
+        let Some(up) = self.streams.lock().unwrap().map.get(id).cloned() else { return };
+        if up.head.is_some() || up.size == 0 {
+            return;
+        }
+        let end = (CHUNK - 1).min(up.size - 1);
+        let url = format!("{}&range=0-{end}", up.url);
+        let bytes = match self.fetch(&up, &url).await {
+            Ok(Some(resp)) => match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => return log::debug!("warming {id} failed: {e}"),
+            },
+            _ => return log::debug!("warming {id} failed"),
+        };
+        let mut st = self.streams.lock().unwrap();
+        if let Some(u) = st.map.get_mut(id).filter(|u| u.url == up.url) {
+            log::debug!("warmed {id}: {} bytes ready", bytes.len());
+            u.head = Some(Arc::new(bytes.to_vec()));
+        }
     }
 
     /// GETs one chunk. Freshly issued stream URLs answer 403 for the first
@@ -125,7 +170,7 @@ impl StreamProxy {
             .map(|(_, v)| v.trim().to_string());
 
         let id = path.strip_prefix("/s/").unwrap_or_default();
-        let Some(up) = self.streams.lock().unwrap().get(id).cloned() else {
+        let Some(up) = self.streams.lock().unwrap().map.get(id).cloned() else {
             sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
             return Ok(());
         };
@@ -170,6 +215,14 @@ impl StreamProxy {
         }
 
         let mut pos = start;
+        // Serve what was fetched ahead of time, then continue upstream.
+        if let Some(head) = &up.head {
+            if (pos as usize) < head.len() {
+                let stop = head.len().min(end as usize + 1);
+                sock.write_all(&head[pos as usize..stop]).await?;
+                pos = stop as u64;
+            }
+        }
         while pos <= end {
             let chunk_end = (pos + CHUNK - 1).min(end);
             let url = format!("{}&range={pos}-{chunk_end}", up.url);

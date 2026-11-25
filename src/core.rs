@@ -220,7 +220,7 @@ impl Core {
                 }
                 self.emit_queue();
                 if let Some(i) = self.index {
-                    self.prefetch(i + 1);
+                    self.prefetch_ahead(i);
                 }
             }
             CoreMsg::Move { .. } => {}
@@ -251,6 +251,11 @@ impl Core {
                         self.cache_stream(id.clone(), stream.clone());
                         if wanted {
                             self.load(&id, &stream);
+                        } else {
+                            // Upcoming track: register it and pre-fetch its start.
+                            self.proxy.register(&id, &stream);
+                            let proxy = self.proxy.clone();
+                            tauri::async_runtime::spawn(async move { proxy.warm(&id).await });
                         }
                     }
                     Err(e) if wanted => {
@@ -268,7 +273,7 @@ impl Core {
                     self.queue.extend(new);
                     self.emit_queue();
                     if let Some(i) = self.index {
-                        self.prefetch(i + 1);
+                        self.prefetch_ahead(i);
                     }
                 }
             }
@@ -342,7 +347,7 @@ impl Core {
                 self.request(&track.id);
             }
         }
-        self.prefetch(i + 1);
+        self.prefetch_ahead(i);
 
         // Near the end of the queue: extend it with YouTube Music's radio for this track.
         if self.cfg.autoplay_radio && i + 2 >= self.queue.len() && self.radio_requested_for.as_deref() != Some(&track.id) {
@@ -420,6 +425,12 @@ impl Core {
             self.streams.clear();
         }
         self.streams.insert(id, stream);
+    }
+
+    /// Prepares the two tracks after `i`, so playing on or skipping once is instant.
+    fn prefetch_ahead(&mut self, i: usize) {
+        self.prefetch(i + 1);
+        self.prefetch(i + 2);
     }
 
     /// Resolves the track at `i` in the background so skipping to it is instant.

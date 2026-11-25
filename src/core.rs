@@ -30,6 +30,7 @@ pub enum CoreMsg {
     PlayNext(Vec<TrackItem>),
     JumpTo(usize),
     Remove(usize),
+    Move { from: usize, to: usize },
     Clear,
     Control(Control),
     SeekBy(f64),
@@ -180,6 +181,28 @@ impl Core {
                 self.emit_queue();
             }
             CoreMsg::Remove(_) => {}
+            CoreMsg::Move { from, to } if from < self.queue.len() && to < self.queue.len() && from != to => {
+                let t = self.queue.remove(from);
+                self.queue.insert(to, t);
+                // Keep pointing at the same (playing) track.
+                if let Some(cur) = self.index {
+                    self.index = Some(if cur == from {
+                        to
+                    } else if from < cur && to >= cur {
+                        cur - 1
+                    } else if from > cur && to <= cur {
+                        cur + 1
+                    } else {
+                        cur
+                    });
+                    self.now.index = self.index;
+                }
+                self.emit_queue();
+                if let Some(i) = self.index {
+                    self.prefetch(i + 1);
+                }
+            }
+            CoreMsg::Move { .. } => {}
             CoreMsg::Clear => {
                 self.queue.clear();
                 self.stop();

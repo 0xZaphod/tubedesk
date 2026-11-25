@@ -67,7 +67,7 @@ The session cookie is stored by rustypipe in
 |---|---|---|
 | `high_quality` | `true` | best Opus stream (~130–160 kbps) vs the smallest |
 | `autoplay_radio` | `true` | continue with radio when the queue ends |
-| `volume` | `0.8` | remembered volume |
+| `volume` | `0.35` | volume slider position (perceptual curve, max −6 dB) |
 | `media_controls` | `true` | MPRIS / media keys |
 | `hide_on_close` | `false` | close button hides the window instead of quitting |
 | `login_user_agent` | `null` | user agent for the Google login window |

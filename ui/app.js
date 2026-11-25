@@ -48,7 +48,13 @@ function toast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { t.hidden = true; }, 4000);
 }
+function showQueue() {
+  $('queue').hidden = false;
+}
+const PLAY_COMMANDS = new Set(['play', 'play_mix']);
+
 async function call(cmd, args) {
+  if (PLAY_COMMANDS.has(cmd)) showQueue();
   try {
     return await invoke(cmd, args);
   } catch (e) {
@@ -311,6 +317,7 @@ document.addEventListener('keydown', (e) => {
 
 function applyState(now) {
   const prevId = state.now && state.now.track && state.now.track.id;
+  if (!prevId && now.track) showQueue();
   state.now = now;
   const t = now.track;
   $('np-title').textContent = t ? t.name : 'Nothing playing';
@@ -332,12 +339,47 @@ function applyState(now) {
   }
 }
 
+// Drag and drop reordering: drop on the upper half of a row = before it.
+let dragFrom = null;
+function clearDropMarks() {
+  for (const li of $('queue-list').children) li.classList.remove('drop-before', 'drop-after');
+}
+function dropTarget(e, i) {
+  const r = e.currentTarget.getBoundingClientRect();
+  return e.clientY < r.top + r.height / 2 ? 'before' : 'after';
+}
+
 function applyQueue(q) {
   state.queue = q;
   $('queue-list').replaceChildren(...q.tracks.map((t, i) => h('li', {
     class: i === q.index ? 'current' : '',
+    draggable: 'true',
     onclick: () => call('queue_jump', { index: i }),
+    ondragstart: (e) => {
+      dragFrom = i;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(i));
+      e.currentTarget.classList.add('dragging');
+    },
+    ondragend: (e) => { e.currentTarget.classList.remove('dragging'); clearDropMarks(); dragFrom = null; },
+    ondragover: (e) => {
+      if (dragFrom === null) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      clearDropMarks();
+      e.currentTarget.classList.add(dropTarget(e, i) === 'before' ? 'drop-before' : 'drop-after');
+    },
+    ondrop: (e) => {
+      e.preventDefault();
+      clearDropMarks();
+      if (dragFrom === null) return;
+      let to = dropTarget(e, i) === 'before' ? i : i + 1;
+      if (dragFrom < to) to -= 1; // removing the dragged row shifts later rows up
+      if (to !== dragFrom) call('queue_move', { from: dragFrom, to });
+      dragFrom = null;
+    },
   },
+    img(t.cover),
     h('div', { class: 'ellipsis' },
       h('div', { class: 'q-title ellipsis', text: t.name }),
       h('div', { class: 'muted ellipsis', text: (t.artists || []).map((a) => a.name).join(', ') })),

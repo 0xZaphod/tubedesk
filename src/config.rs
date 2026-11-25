@@ -10,7 +10,8 @@ pub struct Config {
     pub high_quality: bool,
     /// When the queue runs out, continue with YouTube Music's radio for the last track.
     pub autoplay_radio: bool,
-    /// Playback volume, 0.0–1.0 (remembered).
+    /// Volume slider position, 0.0–1.0 (remembered). Mapped to loudness on a
+    /// perceptual curve with the maximum at −6 dB, see `player::gain`.
     pub volume: f64,
     /// Expose a native MPRIS / media-key player.
     pub media_controls: bool,
@@ -31,7 +32,7 @@ impl Default for Config {
         Self {
             high_quality: true,
             autoplay_radio: true,
-            volume: 0.8,
+            volume: 0.35,
             media_controls: true,
             hide_on_close: false,
             login_user_agent: None,

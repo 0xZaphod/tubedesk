@@ -177,6 +177,11 @@ fn queue_remove(app: State<'_, App>, index: usize) {
 }
 
 #[tauri::command]
+fn queue_move(app: State<'_, App>, from: usize, to: usize) {
+    app.core.send(CoreMsg::Move { from, to });
+}
+
+#[tauri::command]
 fn queue_clear(app: State<'_, App>) {
     app.core.send(CoreMsg::Clear);
 }
@@ -336,7 +341,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
             home, search, library, playlist, album, artist,
-            play, play_mix, enqueue, queue_jump, queue_remove, queue_clear, control, seek, set_volume, sync,
+            play, play_mix, enqueue, queue_jump, queue_remove, queue_move, queue_clear, control, seek, set_volume, sync,
             auth_status, auth_login, auth_import, auth_logout,
         ])
         .setup(setup)

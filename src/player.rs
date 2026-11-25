@@ -5,6 +5,16 @@ use gst::prelude::*;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
+/// Loudest the app ever plays: 50% of full scale (−6 dB).
+const MAX_GAIN: f64 = 0.5;
+
+/// Maps the 0–1 volume slider to an amplitude gain. A cubic curve matches how
+/// loudness is perceived (like PulseAudio/PipeWire sliders), so the low end of
+/// the slider is actually quiet: 20% → −48 dB, 50% → −24 dB, 100% → −6 dB.
+fn gain(slider: f64) -> f64 {
+    MAX_GAIN * slider.clamp(0.0, 1.0).powi(3)
+}
+
 pub enum PlayerCmd {
     Load(String),
     Play,
@@ -63,7 +73,7 @@ fn run(
     };
     // Audio only: never build a video branch.
     playbin.set_property_from_str("flags", "audio+soft-volume");
-    playbin.set_property("volume", volume.clamp(0.0, 1.0));
+    playbin.set_property("volume", gain(volume));
     // e.g. TUBEDESK_AUDIO_SINK="fakesink sync=true" for silent testing.
     if let Ok(desc) = std::env::var("TUBEDESK_AUDIO_SINK") {
         match gst::parse::bin_from_description(&desc, true) {
@@ -160,6 +170,6 @@ fn handle(playbin: &gst::Element, cmd: PlayerCmd, want_playing: &mut bool) {
             let t = gst::ClockTime::from_nseconds((secs.max(0.0) * 1e9) as u64);
             let _ = playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, t);
         }
-        PlayerCmd::Volume(v) => playbin.set_property("volume", v.clamp(0.0, 1.0)),
+        PlayerCmd::Volume(v) => playbin.set_property("volume", gain(v)),
     }
 }

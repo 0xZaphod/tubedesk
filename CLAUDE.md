@@ -71,7 +71,10 @@ restore-on-start.
 - Lookups run on `resolver::Lane`s: `Now` (the track the user waits for,
   unlimited), `Ahead` (2 slots: `prefetch_ahead`, a list's first track) and
   `Speculative` (1 slot, dropped when busy or stale: hover hints, prepared and
-  pinned lists), so guesses never delay the next track.
+  pinned lists), so guesses never delay the next track. `prefetch_ahead`
+  looks up both next tracks in one yt-dlp run (`resolver::resolve` takes ids).
+- Stream URLs expire (their `expire=` parameter): the proxy asks the core for
+  a new one (`CoreMsg::Refresh`) when a URL expired or keeps being refused.
 - A list's later pages arrive as `Extend` tagged with the `PlayList` token;
   anything started in between invalidates it.
 - Resuming at a position uses `PlayerCmd::LoadAt`: preroll paused, seek, then

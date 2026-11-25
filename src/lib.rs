@@ -57,6 +57,7 @@ type Query = rustypipe::client::RustyPipeQuery;
 ///    (rustypipe can't parse the signed-in page of playlists you *own*),
 /// 2. signed in: private playlists,
 /// 3. as a radio: personal mixes (`RDTMAK…`) only exist as radios.
+///
 /// Returns the playlist (if any) and the query that worked, for paging on.
 async fn playlist_first_page(q: &Query, id: &str) -> Res<(Option<rustypipe::model::MusicPlaylist>, Vec<TrackItem>, Query)> {
     if !id.starts_with("RDTMAK") {
@@ -287,11 +288,11 @@ async fn artist(app: State<'_, App>, id: String) -> Res<rustypipe::model::MusicA
 
 /// The home page as it was last loaded (instant, possibly stale).
 #[tauri::command]
-fn home_cached(app: State<'_, App>) -> Vec<home::HomeSection> {
-    std::fs::read(&app.home_cache_path)
+async fn home_cached(app: State<'_, App>) -> Res<Vec<home::HomeSection>> {
+    Ok(std::fs::read(&app.home_cache_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// One page of the live home feed; `token` = None starts over.
@@ -305,7 +306,7 @@ async fn home_page(app: State<'_, App>, token: Option<String>) -> Res<home::Home
     }
     all.extend(page.sections.iter().cloned());
     if let Ok(json) = serde_json::to_vec(&*all) {
-        let _ = std::fs::write(&app.home_cache_path, json);
+        let _ = config::write_atomic(&app.home_cache_path, &json);
     }
     Ok(page)
 }
@@ -366,10 +367,8 @@ async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool)
             if let Err(e) = pages.extend_limit(&query, LIST_LIMIT).await {
                 log::warn!("loading the rest of {id} failed: {e}");
             }
-            let mut rest: Vec<TrackItem> = pages.items.into_iter().skip(first_len).collect();
-            if shuffle {
-                crate::shuffle(&mut rest);
-            }
+            // A shuffled list's rest is shuffled in by the core.
+            let rest: Vec<TrackItem> = pages.items.into_iter().skip(first_len).collect();
             if !rest.is_empty() {
                 core.send(CoreMsg::Extend { token, tracks: rest });
             }
@@ -440,18 +439,19 @@ fn load_pins(app: &App) -> Vec<home::HomeItem> {
 
 fn save_pins(app: &App, pins: &[home::HomeItem]) -> Res<()> {
     let json = serde_json::to_vec_pretty(pins).map_err(err)?;
-    std::fs::write(&app.pins_path, json).map_err(err)
+    config::write_atomic(&app.pins_path, &json).map_err(err)
 }
 
 /// Your own pinned songs, playlists, albums and mixes (stored locally).
+// File I/O: async commands, so it stays off the main thread.
 #[tauri::command]
-fn pins(app: State<'_, App>) -> Vec<home::HomeItem> {
-    load_pins(&app)
+async fn pins(app: State<'_, App>) -> Res<Vec<home::HomeItem>> {
+    Ok(load_pins(&app))
 }
 
 /// Pins an item at the front (re-pinning moves it there). Returns all pins.
 #[tauri::command]
-fn pin(app: State<'_, App>, item: home::HomeItem) -> Res<Vec<home::HomeItem>> {
+async fn pin(app: State<'_, App>, item: home::HomeItem) -> Res<Vec<home::HomeItem>> {
     let _guard = app.pins_lock.lock().unwrap();
     let mut pins = load_pins(&app);
     pins.retain(|p| !(p.kind == item.kind && p.id == item.id));
@@ -461,7 +461,7 @@ fn pin(app: State<'_, App>, item: home::HomeItem) -> Res<Vec<home::HomeItem>> {
 }
 
 #[tauri::command]
-fn unpin(app: State<'_, App>, kind: String, id: String) -> Res<Vec<home::HomeItem>> {
+async fn unpin(app: State<'_, App>, kind: String, id: String) -> Res<Vec<home::HomeItem>> {
     let _guard = app.pins_lock.lock().unwrap();
     let mut pins = load_pins(&app);
     pins.retain(|p| !(p.kind == kind && p.id == id));
@@ -491,13 +491,14 @@ fn seek(app: State<'_, App>, position: f64) {
 }
 
 #[tauri::command]
-fn set_volume(app: State<'_, App>, volume: f64, persist: bool) {
+async fn set_volume(app: State<'_, App>, volume: f64, persist: bool) -> Res<()> {
     app.core.send(CoreMsg::Volume(volume));
     if persist {
         let mut cfg = app.config.lock().unwrap();
         cfg.volume = volume.clamp(0.0, 1.0);
         cfg.save();
     }
+    Ok(())
 }
 
 /// Re-sends the current `state` and `queue` events (UI start-up).

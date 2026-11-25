@@ -47,12 +47,17 @@ pub fn open_login_window(app: &AppHandle, rp: RustyPipe, user_agent: Option<Stri
         return Ok(());
     }
     let url = LOGIN_URL.parse().expect("valid login url");
+    // Redirects can report several YouTube pages; take the cookies once.
+    let taken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut builder = WebviewWindowBuilder::new(app, LOGIN_LABEL, WebviewUrl::External(url))
         .title("Sign in to YouTube")
         .inner_size(480.0, 720.0)
         .incognito(true)
         .on_page_load(move |webview, payload| {
             if payload.event() != PageLoadEvent::Started || !is_done(payload.url()) {
+                return;
+            }
+            if taken.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
             log::info!("login redirected back to {}", payload.url().host_str().unwrap_or_default());

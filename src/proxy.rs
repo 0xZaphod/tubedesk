@@ -19,7 +19,7 @@
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -35,12 +35,17 @@ pub const QUICK_LIMIT: u64 = 450_000;
 const FULL_WARMUP: Duration = Duration::from_millis(3500);
 /// How long a request past the quick part waits for the full URL to arrive.
 const FULL_WAIT: Duration = Duration::from_secs(30);
+/// A full URL this close to its expiry is replaced before the next chunk.
+const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+
+type RefreshFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone)]
 struct Full {
     url: String,
     headers: Vec<(String, String)>,
     registered: Instant,
+    expires: Option<SystemTime>,
 }
 
 #[derive(Clone)]
@@ -78,6 +83,8 @@ pub struct StreamProxy {
     port: u16,
     streams: Arc<Mutex<Streams>>,
     http: reqwest::Client,
+    /// Asks for a new full URL of a stream (set by the core).
+    refresh: Arc<Mutex<Option<RefreshFn>>>,
 }
 
 impl StreamProxy {
@@ -87,6 +94,7 @@ impl StreamProxy {
         let proxy = Self {
             port,
             streams: Arc::default(),
+            refresh: Arc::default(),
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .build()
@@ -112,6 +120,33 @@ impl StreamProxy {
         Ok(proxy)
     }
 
+    /// Sets how to ask for a new full URL when one expired or is refused.
+    pub fn on_refresh(&self, f: impl Fn(&str) + Send + Sync + 'static) {
+        *self.refresh.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    /// Drops `full` (if still current) and asks for a new full URL; requests
+    /// then wait for it in `wait_full`. Once per connection (`done`).
+    fn request_refresh(&self, id: &str, full: &Full, done: &mut bool) -> bool {
+        if *done {
+            return false;
+        }
+        *done = true;
+        if let Some(u) = self.streams.lock().unwrap().map.get_mut(id) {
+            if u.full.as_ref().is_some_and(|f| f.url == full.url) {
+                u.full = None;
+            }
+        }
+        let f = self.refresh.lock().unwrap().clone();
+        match f {
+            Some(f) => {
+                f(id);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn local_url(&self, id: &str) -> String {
         format!("http://127.0.0.1:{}/s/{}", self.port, id)
     }
@@ -121,7 +156,7 @@ impl StreamProxy {
     /// quick URL registered earlier is kept if the file sizes match.
     pub fn register(&self, id: &str, s: &crate::resolver::Stream) -> String {
         let mut st = self.streams.lock().unwrap();
-        let full = Full { url: s.url.clone(), headers: s.headers.clone(), registered: Instant::now() };
+        let full = Full { url: s.url.clone(), headers: s.headers.clone(), registered: Instant::now(), expires: s.expires };
         match st.map.get_mut(id) {
             Some(u) if u.full.as_ref().is_some_and(|f| f.url == s.url) => {}
             Some(u) => {
@@ -320,6 +355,7 @@ impl StreamProxy {
         }
 
         let mut pos = start;
+        let mut refreshed = false;
         while pos <= end {
             // Re-read each round: the full URL or a warmed head may arrive meanwhile.
             let Some(up) = self.streams.lock().unwrap().map.get(&id).cloned() else { return Ok(()) };
@@ -370,6 +406,14 @@ impl StreamProxy {
                 log::warn!("{id}: no full stream URL arrived");
                 return Ok(());
             };
+            // E.g. after a long pause: YouTube would refuse it.
+            if full.expires.is_some_and(|t| t <= SystemTime::now() + EXPIRY_MARGIN) {
+                log::info!("{id}: stream URL expired; asking for a new one");
+                if !self.request_refresh(&id, &full, &mut refreshed) {
+                    return Ok(());
+                }
+                continue;
+            }
             let warmup = FULL_WARMUP.saturating_sub(full.registered.elapsed());
             if !warmup.is_zero() {
                 log::debug!("{id}: full URL still warming up; waiting {} ms", warmup.as_millis());
@@ -380,6 +424,9 @@ impl StreamProxy {
             log::debug!("upstream {id}: bytes {pos}-{chunk_end}");
             let Some(resp) = self.fetch(&full.headers, &url, RETRIES).await? else {
                 log::warn!("upstream kept refusing {id} at byte {pos}");
+                if self.request_refresh(&id, &full, &mut refreshed) {
+                    continue;
+                }
                 return Ok(());
             };
             let mut body = resp.bytes_stream();

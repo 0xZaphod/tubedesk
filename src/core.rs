@@ -7,7 +7,7 @@ use crate::proxy::StreamProxy;
 use crate::resolver::{self, Lane, Stream};
 use rustypipe::client::RustyPipe;
 use rustypipe::model::TrackItem;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender as StdSender;
@@ -54,6 +54,8 @@ pub enum CoreMsg {
     Resolved { id: String, result: Result<Stream, String> },
     /// A quick URL for the start of `id` (see `resolver::quick`).
     QuickResolved { id: String, url: String, size: u64, mime: String },
+    /// The proxy found `id`'s stream URL expired (or refused): look it up again.
+    Refresh(String),
     RadioLoaded { for_id: String, tracks: Vec<TrackItem> },
     Sync,
 }
@@ -106,7 +108,7 @@ pub struct CoreConfig {
 }
 
 /// The last session, restored (paused) at start-up.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct Session {
     tracks: Vec<TrackItem>,
     index: Option<usize>,
@@ -117,12 +119,29 @@ struct Session {
     duration: f64,
 }
 
+/// The list being played, while its later pages may still arrive.
+struct ListInfo {
+    token: u64,
+    shuffled: bool,
+    /// Ids of the first page, to tell them from tracks queued by hand.
+    ids: HashSet<String>,
+}
+
 /// Lookups of one track id in flight.
 #[derive(Default)]
 struct Lookup {
     /// One of them is a foreground lookup (the track the user waits for).
     foreground: bool,
     running: u32,
+}
+
+/// [`Session`] as written (borrowing the queue instead of copying it).
+#[derive(Serialize)]
+struct SessionRef<'a> {
+    tracks: &'a [TrackItem],
+    index: Option<usize>,
+    position: f64,
+    duration: f64,
 }
 
 struct Core {
@@ -141,12 +160,13 @@ struct Core {
     /// yt-dlp lookups in flight by id: at most one background and one
     /// foreground lookup per id.
     inflight: HashMap<String, Lookup>,
-    /// Token of the list being played, while its later pages may still arrive.
-    list_token: Option<u64>,
+    list: Option<ListInfo>,
     /// Track id the tray tooltip / window title were last set for.
     titled: Option<Option<String>>,
     /// The queue or index changed: save the session once the message is handled.
     dirty: bool,
+    /// Latest session file contents, for the writer thread.
+    session_tx: StdSender<Vec<u8>>,
     /// Restored from the last session but not loaded yet: Play resumes it.
     restored: bool,
     /// Seek here once the (resumed) track starts playing.
@@ -170,6 +190,9 @@ pub fn spawn(
     let me = CoreHandle(tx);
     let me2 = me.clone();
     let player = Player::spawn(cfg.volume, move |ev| me2.send(CoreMsg::Player(ev)))?;
+    let me3 = me.clone();
+    proxy.on_refresh(move |id| me3.send(CoreMsg::Refresh(id.to_string())));
+    let session_tx = spawn_session_writer(cfg.session_path.clone());
     let core = Core {
         app,
         rp,
@@ -183,7 +206,8 @@ pub fn spawn(
         index: None,
         awaiting: None,
         inflight: Default::default(),
-        list_token: None,
+        list: None,
+        session_tx,
         titled: None,
         dirty: false,
         restored: false,
@@ -197,6 +221,23 @@ pub fn spawn(
     core.restore();
     tauri::async_runtime::spawn(core.run(rx));
     Ok(me)
+}
+
+/// Writes the session file on its own thread (it can be large: the whole
+/// queue), skipping versions that were superseded before they got written.
+fn spawn_session_writer(path: std::path::PathBuf) -> StdSender<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let _ = std::thread::Builder::new().name("session-writer".into()).spawn(move || {
+        while let Ok(mut bytes) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                bytes = newer;
+            }
+            if let Err(e) = crate::config::write_atomic(&path, &bytes) {
+                log::debug!("could not save session: {e}");
+            }
+        }
+    });
+    tx
 }
 
 impl Core {
@@ -214,7 +255,7 @@ impl Core {
             CoreMsg::PlayTracks { tracks, start } => {
                 self.queue = tracks;
                 self.radio_requested_for = None;
-                self.list_token = None;
+                self.list = None;
                 self.start_at(start.min(self.queue.len().saturating_sub(1)));
                 self.emit_queue();
             }
@@ -229,8 +270,9 @@ impl Core {
                 self.handle(CoreMsg::PlayTracks { tracks, start: 0 });
             }
             CoreMsg::PlayList { tracks, shuffled, token } => {
+                let ids = if shuffled { tracks.iter().map(|t| t.id.clone()).collect() } else { HashSet::new() };
                 self.handle(if shuffled { CoreMsg::PlayShuffled(tracks) } else { CoreMsg::PlayTracks { tracks, start: 0 } });
-                self.list_token = Some(token);
+                self.list = Some(ListInfo { token, shuffled, ids });
             }
             CoreMsg::Enqueue(tracks) => {
                 let was_empty = self.queue.is_empty();
@@ -290,10 +332,14 @@ impl Core {
             }
             CoreMsg::Move { .. } => {}
             CoreMsg::Extend { token, tracks } => {
-                if self.list_token == Some(token) {
-                    self.list_token = None; // a list's rest arrives once
-                    log::info!("appended {} more tracks of the list", tracks.len());
-                    self.queue.extend(tracks);
+                // A list's rest arrives once, and only counts for that list.
+                if let Some(list) = self.list.take_if(|l| l.token == token) {
+                    log::info!("adding {} more tracks of the list", tracks.len());
+                    if list.shuffled {
+                        self.mix_in(&list.ids, tracks);
+                    } else {
+                        self.queue.extend(tracks);
+                    }
                     self.emit_queue();
                     if let Some(i) = self.index {
                         self.prefetch_ahead(i);
@@ -311,13 +357,18 @@ impl Core {
             }
             CoreMsg::Clear => {
                 self.queue.clear();
-                self.list_token = None;
+                self.list = None;
                 self.stop();
                 self.emit_queue();
             }
             CoreMsg::Control(c) => self.control(c),
-            CoreMsg::SeekBy(d) => self.player.send(PlayerCmd::Seek(self.now.position + d)),
-            CoreMsg::SeekTo(t) => self.player.send(PlayerCmd::Seek(t)),
+            CoreMsg::SeekBy(d) => self.seek_to(self.now.position + d),
+            CoreMsg::SeekTo(t) => self.seek_to(t),
+            CoreMsg::Refresh(id) => {
+                log::info!("{id}: stream URL expired or refused; looking it up again");
+                self.streams.remove(&id);
+                self.request_now(&id);
+            }
             CoreMsg::Volume(v) => {
                 let v = v.clamp(0.0, 1.0);
                 self.now.volume = v;
@@ -441,6 +492,42 @@ impl Core {
                 }
             }
         }
+    }
+
+    fn seek_to(&mut self, t: f64) {
+        let t = t.max(0.0);
+        // Nothing loaded yet (restored, or the URL is still being looked up):
+        // the idle player would ignore the seek, so start there instead.
+        if self.restored || self.awaiting.is_some() {
+            self.now.position = t;
+            if self.awaiting.is_some() {
+                self.pending_seek = Some(t);
+            } else {
+                self.dirty = true; // resume from here, also after a restart
+            }
+            self.emit_state();
+            return;
+        }
+        self.player.send(PlayerCmd::Seek(t));
+    }
+
+    /// Shuffles a shuffled list's later pages in with its not yet played
+    /// first-page tracks, so a long list isn't played first page first.
+    /// Tracks queued by hand, the current track and the two prepared after
+    /// it stay where they are.
+    fn mix_in(&mut self, ids: &HashSet<String>, rest: Vec<TrackItem>) {
+        let keep = self.index.map_or(0, |i| i + 3).min(self.queue.len());
+        let slots: Vec<usize> = (keep..self.queue.len()).filter(|&k| ids.contains(&self.queue[k].id)).collect();
+        let mut pool: Vec<TrackItem> = slots.iter().map(|&k| self.queue[k].clone()).collect();
+        pool.extend(rest);
+        crate::shuffle(&mut pool);
+        let mut pool = pool.into_iter();
+        for &k in &slots {
+            if let Some(t) = pool.next() {
+                self.queue[k] = t;
+            }
+        }
+        self.queue.extend(pool);
     }
 
     fn advance(&mut self) {
@@ -618,23 +705,25 @@ impl Core {
     }
 
     /// Prepares the two tracks after `i`, so playing on or skipping once is instant.
+    /// Both missing ones are looked up in one yt-dlp run.
     fn prefetch_ahead(&mut self, i: usize) {
-        self.prefetch(i + 1);
-        self.prefetch(i + 2);
-    }
-
-    /// Resolves the track at `i` in the background so skipping to it is instant.
-    fn prefetch(&mut self, i: usize) {
-        let Some(id) = self.queue.get(i).map(|t| t.id.clone()) else { return };
-        match self.streams.get(&id).filter(|s| s.is_fresh()) {
-            // Already prepared: re-register so the proxy keeps its warmed start
-            // (its eviction is oldest-registered-first), and warm it if it was
-            // only resolved as a hover hint.
-            Some(s) => {
-                self.proxy.register(&id, s);
-                self.warm(&id);
+        let mut missing = Vec::new();
+        for k in [i + 1, i + 2] {
+            let Some(id) = self.queue.get(k).map(|t| t.id.clone()) else { continue };
+            match self.streams.get(&id).filter(|s| s.is_fresh()) {
+                // Already prepared: re-register so the proxy keeps its warmed
+                // start (its eviction is oldest-registered-first), and warm it
+                // if it was only resolved as a hover hint.
+                Some(s) => {
+                    self.proxy.register(&id, s);
+                    self.warm(&id);
+                }
+                None if !self.inflight.contains_key(&id) && !missing.contains(&id) => missing.push(id),
+                None => {}
             }
-            None => self.request(&id),
+        }
+        if !missing.is_empty() {
+            self.spawn_resolve(missing, Lane::Ahead);
         }
     }
 
@@ -643,7 +732,7 @@ impl Core {
     /// next tracks.
     fn request_background(&mut self, id: &str) {
         if self.inflight.len() < 4 && !self.inflight.contains_key(id) {
-            self.spawn_resolve(id, Lane::Speculative);
+            self.spawn_resolve(vec![id.to_string()], Lane::Speculative);
         }
     }
 
@@ -653,7 +742,7 @@ impl Core {
         if self.inflight.contains_key(id) {
             return;
         }
-        self.spawn_resolve(id, Lane::Ahead);
+        self.spawn_resolve(vec![id.to_string()], Lane::Ahead);
     }
 
     /// Starts a lookup for the track the user is waiting for, bypassing the
@@ -664,17 +753,21 @@ impl Core {
         if self.inflight.get(id).is_some_and(|l| l.foreground) {
             return;
         }
-        self.spawn_resolve(id, Lane::Now);
+        self.spawn_resolve(vec![id.to_string()], Lane::Now);
     }
 
-    fn spawn_resolve(&mut self, id: &str, lane: Lane) {
-        let lookup = self.inflight.entry(id.to_string()).or_default();
-        lookup.running += 1;
-        lookup.foreground |= lane == Lane::Now;
-        let (me, ytdlp, hq, id) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality, id.to_string());
+    /// Looks up `ids` in one yt-dlp run; each sends its own `Resolved`.
+    fn spawn_resolve(&mut self, ids: Vec<String>, lane: Lane) {
+        for id in &ids {
+            let lookup = self.inflight.entry(id.clone()).or_default();
+            lookup.running += 1;
+            lookup.foreground |= lane == Lane::Now;
+        }
+        let (me, ytdlp, hq) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality);
         tauri::async_runtime::spawn(async move {
-            let result = resolver::resolve(&ytdlp, &id, hq, lane).await;
-            me.send(CoreMsg::Resolved { id, result });
+            for (id, result) in resolver::resolve(&ytdlp, &ids, hq, lane).await {
+                me.send(CoreMsg::Resolved { id, result });
+            }
         });
     }
 
@@ -735,17 +828,15 @@ impl Core {
     }
 
     fn save_session(&self) {
-        let s = Session {
-            tracks: self.queue.clone(),
+        let s = SessionRef {
+            tracks: &self.queue,
             index: self.index,
             position: self.now.position,
             duration: self.now.duration,
         };
         match serde_json::to_vec(&s) {
             Ok(b) => {
-                if let Err(e) = std::fs::write(&self.cfg.session_path, b) {
-                    log::debug!("could not save session: {e}");
-                }
+                let _ = self.session_tx.send(b);
             }
             Err(e) => log::debug!("could not serialize session: {e}"),
         }

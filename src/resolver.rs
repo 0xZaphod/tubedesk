@@ -7,7 +7,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
@@ -31,7 +31,10 @@ pub enum Lane {
 }
 
 /// Stream URLs expire after ~6 h; don't reuse cached ones near that.
+/// Used when the URL carries no `expire=` time.
 const MAX_AGE: Duration = Duration::from_secs(4 * 3600);
+/// A URL needs at least this long left to be used for a new playback.
+const MIN_LEFT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone)]
 pub struct Stream {
@@ -41,12 +44,17 @@ pub struct Stream {
     pub mime: String,
     /// Track length in seconds, as reported by yt-dlp.
     pub duration: Option<f64>,
+    /// When YouTube stops accepting the URL (its `expire=` parameter).
+    pub expires: Option<SystemTime>,
     fetched: Instant,
 }
 
 impl Stream {
     pub fn is_fresh(&self) -> bool {
-        self.fetched.elapsed() < MAX_AGE
+        match self.expires {
+            Some(t) => t.duration_since(SystemTime::now()).is_ok_and(|left| left > MIN_LEFT),
+            None => self.fetched.elapsed() < MAX_AGE,
+        }
     }
 
     pub fn age(&self) -> Duration {
@@ -56,6 +64,7 @@ impl Stream {
 
 #[derive(Deserialize)]
 struct YtDlpFormat {
+    id: String,
     url: String,
     #[serde(default)]
     http_headers: HashMap<String, String>,
@@ -84,15 +93,24 @@ pub async fn quick(rp: &rustypipe::client::RustyPipe, id: &str, high_quality: bo
     Ok((s.url.clone(), s.size, s.mime.clone()))
 }
 
-pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool, lane: Lane) -> Result<Stream, String> {
+/// Looks up `ids` in one yt-dlp run (saving a Python start and a JS
+/// challenge solve per extra track). Returns a result for every id.
+pub async fn resolve(ytdlp: &str, ids: &[String], high_quality: bool, lane: Lane) -> Vec<(String, Result<Stream, String>)> {
+    let all_failed = |e: String| ids.iter().map(|id| (id.clone(), Err(e.clone()))).collect();
     let queued = Instant::now();
     let _permit = match lane {
         Lane::Now => None,
-        Lane::Ahead => Some(AHEAD.acquire().await.map_err(|e| e.to_string())?),
+        Lane::Ahead => match AHEAD.acquire().await {
+            Ok(p) => Some(p),
+            Err(e) => return all_failed(e.to_string()),
+        },
         Lane::Speculative => {
-            let permit = SPECULATIVE.acquire().await.map_err(|e| e.to_string())?;
+            let permit = match SPECULATIVE.acquire().await {
+                Ok(p) => p,
+                Err(e) => return all_failed(e.to_string()),
+            };
             if queued.elapsed() > STALE_HINT {
-                return Err("hint dropped (waited too long)".into());
+                return all_failed("hint dropped (waited too long)".into());
             }
             Some(permit)
         }
@@ -103,27 +121,52 @@ pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool, lane: Lane) -> R
     } else {
         "249/worstaudio[acodec=opus]/worstaudio"
     };
-    let url = format!("https://music.youtube.com/watch?v={id}");
-    let out = Command::new(ytdlp)
-        .args(["--quiet", "--no-warnings", "--no-playlist", "-f", format, "-j", &url])
+    let urls: Vec<String> = ids.iter().map(|id| format!("https://music.youtube.com/watch?v={id}")).collect();
+    let out = match Command::new(ytdlp)
+        .args(["--quiet", "--no-warnings", "--no-playlist", "-f", format, "-j"])
+        .args(&urls)
         .kill_on_drop(true)
         .output()
         .await
-        .map_err(|e| format!("could not run {ytdlp} (is yt-dlp installed?): {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp failed");
-        return Err(line.trim().to_string());
-    }
-    let f: YtDlpFormat = serde_json::from_slice(&out.stdout).map_err(|e| format!("unexpected yt-dlp output: {e}"))?;
+    {
+        Ok(out) => out,
+        Err(e) => return all_failed(format!("could not run {ytdlp} (is yt-dlp installed?): {e}")),
+    };
+    // One JSON object per line for each video that worked (yt-dlp goes on
+    // after a failed one and reports it on stderr).
+    let mut found: HashMap<String, YtDlpFormat> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<YtDlpFormat>(l).map_err(|e| log::warn!("unexpected yt-dlp output: {e}")).ok())
+        .map(|f| (f.id.clone(), f))
+        .collect();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    ids.iter()
+        .map(|id| {
+            let result = match found.remove(id) {
+                Some(f) => Ok(stream(id, f)),
+                None => {
+                    let lines = || stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+                    let line = lines().rfind(|l| l.contains(id.as_str())).or_else(|| lines().next_back());
+                    Err(line.unwrap_or("yt-dlp returned no stream").to_string())
+                }
+            };
+            (id.clone(), result)
+        })
+        .collect()
+}
 
+fn url_param<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+    url.split(['?', '&']).find_map(|p| p.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn stream(id: &str, f: YtDlpFormat) -> Stream {
     // Fall back to the `clen` URL parameter when yt-dlp has no exact size.
-    let clen = f
-        .url
-        .split(['?', '&'])
-        .find_map(|p| p.strip_prefix("clen="))
-        .and_then(|v| v.parse().ok());
+    let clen = url_param(&f.url, "clen").and_then(|v| v.parse().ok());
     let size = f.filesize.or(clen).or(f.filesize_approx).unwrap_or(0);
+    let expires = url_param(&f.url, "expire")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
     let mime = match (f.ext.as_deref(), f.acodec.as_deref()) {
         (Some("webm"), _) | (_, Some("opus")) => "audio/webm",
         (Some("m4a"), _) | (Some("mp4"), _) => "audio/mp4",
@@ -136,12 +179,13 @@ pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool, lane: Lane) -> R
         f.abr.unwrap_or(0.0),
         size
     );
-    Ok(Stream {
+    Stream {
         url: f.url,
         headers: f.http_headers.into_iter().collect(),
         size,
         mime: mime.to_string(),
         duration: f.duration,
+        expires,
         fetched: Instant::now(),
-    })
+    }
 }

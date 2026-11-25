@@ -648,7 +648,10 @@ function applyState(now) {
   $('np-artist').replaceChildren(...(t ? artistLinks(t.artists) : []));
   const cover = t && thumb(t.cover);
   if (cover) $('np-cover').src = cover; else $('np-cover').removeAttribute('src');
-  $('toggle').textContent = now.loading ? '…' : (now.playing ? '⏸' : '▶');
+  // Always show what Play/Pause will do; loading is a ring around the button,
+  // so the button stays usable (and its state honest) while a track starts.
+  $('toggle').textContent = now.playing ? '⏸' : '▶';
+  $('toggle').classList.toggle('busy', !!(now.loading || now.buffering) && !!now.track);
   const hold = state.seekHold;
   if (hold && (Date.now() > hold.until || Math.abs(now.position - hold.target) < 2)) state.seekHold = null;
   if (!state.seeking && !state.seekHold) {

@@ -73,6 +73,8 @@ pub struct NowPlaying {
     pub index: Option<usize>,
     pub playing: bool,
     pub loading: bool,
+    /// A seek (or resume) is in progress: show a busy state, keep controls live.
+    pub buffering: bool,
     pub position: f64,
     pub duration: f64,
     pub volume: f64,
@@ -353,6 +355,17 @@ impl Core {
 
     fn control(&mut self, c: Control) {
         log::debug!("control {c:?} (playing={}, loading={})", self.now.playing, self.now.loading);
+        // The track isn't loaded yet (its URL is still being looked up): the
+        // player is idle, so remember the choice and apply it on load.
+        if self.awaiting.is_some() && matches!(c, Control::Play | Control::Pause | Control::Toggle) {
+            self.now.playing = match c {
+                Control::Play => true,
+                Control::Pause => false,
+                _ => !self.now.playing,
+            };
+            self.emit_state();
+            return;
+        }
         match c {
             Control::Play | Control::Toggle if self.restored => self.resume(),
             Control::Play if self.index.is_none() && !self.queue.is_empty() => self.start_at(0),
@@ -406,10 +419,13 @@ impl Core {
         self.index = Some(i);
         self.player.send(PlayerCmd::Stop);
         self.now = NowPlaying {
-            duration: track.duration.unwrap_or(0) as f64,
+            duration: if from.is_some() && self.now.duration > 0.0 { self.now.duration } else { track.duration.unwrap_or(0) as f64 },
             track: Some(track.clone()),
             index: Some(i),
             loading: true,
+            playing: true,
+            // Resuming: show the saved position right away, not 0:00.
+            position: from.unwrap_or(0.0),
             volume: self.now.volume,
             ..Default::default()
         };
@@ -468,13 +484,18 @@ impl Core {
                 self.advance();
             }
             PlayerEvent::Error(e) => self.failed(e),
-            PlayerEvent::Tick { position, duration, playing } => {
-                // While showing a restored (not yet loaded) track, the idle
-                // player's ticks would reset the remembered position.
-                if self.index.is_none() || self.restored {
+            PlayerEvent::Tick { position, duration, playing, buffering } => {
+                // While showing a restored track, or while the current track
+                // isn't loaded yet, the idle player's ticks (position 0) would
+                // make the seek bar jump to the start.
+                if self.index.is_none() || self.restored || self.awaiting.is_some() {
                     return;
                 }
-                if playing && position > 0.0 && self.now.loading {
+                self.now.buffering = buffering;
+                if !playing && !buffering && self.now.loading {
+                    self.now.loading = false; // loaded but paused: nothing to wait for
+                }
+                if playing && !buffering && position > 0.0 && self.now.loading {
                     log::info!("playback started");
                     self.now.loading = false;
                     self.consecutive_errors = 0;
@@ -508,6 +529,9 @@ impl Core {
             Some(pos) => PlayerCmd::LoadAt(uri, pos),
             None => PlayerCmd::Load(uri),
         });
+        if !self.now.playing {
+            self.player.send(PlayerCmd::Pause); // paused while it was loading
+        }
     }
 
     fn cache_stream(&mut self, id: String, stream: Stream) {

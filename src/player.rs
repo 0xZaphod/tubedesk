@@ -31,7 +31,9 @@ pub enum PlayerCmd {
 pub enum PlayerEvent {
     Eos,
     Error(String),
-    Tick { position: f64, duration: f64, playing: bool },
+    /// `playing` is the intent (what Play/Pause last asked for); `buffering`
+    /// is true while a resume seek or a seek is still being carried out.
+    Tick { position: f64, duration: f64, playing: bool, buffering: bool },
 }
 
 #[derive(Clone)]
@@ -89,7 +91,7 @@ fn run(
     let mut want_playing = false;
     // GStreamer often posts several errors for one failure; report only the first per load.
     let mut errored = false;
-    let mut last_tick = (f64::NAN, f64::NAN, false);
+    let mut last_tick = (f64::NAN, f64::NAN, false, false);
     // While a seek is being carried out GStreamer reports no (or the old)
     // position; report the seek target instead so the UI doesn't jump to 0.
     let mut seek_target: Option<(f64, std::time::Instant)> = None;
@@ -189,13 +191,15 @@ fn run(
         let duration = playbin
             .query_duration::<gst::ClockTime>()
             .map_or(0.0, |t| t.nseconds() as f64 / 1e9);
-        // Not "playing" until a LoadAt's seek has been made.
-        let playing = want_playing && pending_start.is_none();
-        let tick = (position, duration, playing);
-        if tick.0 != last_tick.0 || tick.1 != last_tick.1 || tick.2 != last_tick.2 {
+        // Report the intent, so the Play/Pause button reflects the last click
+        // even while a resume seek is still in progress.
+        let playing = want_playing;
+        let buffering = pending_start.is_some() || seek_target.is_some();
+        let tick = (position, duration, playing, buffering);
+        if tick.0 != last_tick.0 || tick.1 != last_tick.1 || tick.2 != last_tick.2 || tick.3 != last_tick.3 {
             last_tick = tick;
-            log::trace!("tick {position:.2}/{duration:.0} playing={playing}");
-            on_event(PlayerEvent::Tick { position, duration, playing });
+            log::trace!("tick {position:.2}/{duration:.0} playing={playing} buffering={buffering}");
+            on_event(PlayerEvent::Tick { position, duration, playing, buffering });
         }
     }
     let _ = playbin.set_state(gst::State::Null);

@@ -118,7 +118,13 @@ h2 { font-size: 16px; margin: 18px 0 8px; }
 
 .icon { width: 34px; height: 34px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 16px; }
 .icon:hover { background: var(--hover); }
-.icon.big { width: 42px; height: 42px; background: var(--text); color: var(--bg); font-size: 15px; }
+.icon.big { width: 42px; height: 42px; background: var(--text); color: var(--bg); font-size: 15px; position: relative; }
+.icon.big.busy::after {
+  content: ""; position: absolute; inset: -4px; border-radius: 50%;
+  border: 2px solid transparent; border-top-color: var(--accent);
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 .text { color: var(--muted); padding: 4px 8px; border-radius: 6px; }
 .text:hover { color: var(--text); background: var(--hover); }
 .btn { background: var(--accent); color: var(--accent-text); padding: 8px 16px; border-radius: 8px; font-weight: 600; }

@@ -41,12 +41,13 @@ function fmt(sec) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 let toastTimer;
-function toast(msg) {
+// Short confirmations disappear quickly; errors stay longer to be read.
+function toast(msg, { error = false } = {}) {
   const t = $('toast');
   t.textContent = msg;
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 4000);
+  toastTimer = setTimeout(() => { t.hidden = true; }, error ? 4000 : 2000);
 }
 function showQueue() {
   $('queue').hidden = false;
@@ -58,7 +59,7 @@ async function call(cmd, args) {
   try {
     return await invoke(cmd, args);
   } catch (e) {
-    toast(String(e));
+    toast(String(e), { error: true });
     throw e;
   }
 }
@@ -669,7 +670,7 @@ $('add-to-playlist').addEventListener('click', async (e) => {
   try {
     list = withLocalChanges(track.id, await loadOptions(track.id));
   } catch (err) {
-    toast(`Could not load your playlists: ${err}`);
+    toast(`Could not load your playlists: ${err}`, { error: true });
     return;
   } finally {
     button.disabled = false;
@@ -728,7 +729,7 @@ function applyState(now) {
   }
   $('dur').textContent = fmt(now.duration);
   if (document.activeElement !== vol) vol.value = now.volume;
-  if (now.error && now.error !== lastError) toast(`Playback failed: ${now.error}`);
+  if (now.error && now.error !== lastError) toast(`Playback failed: ${now.error}`, { error: true });
   lastError = now.error;
   const id = t && t.id;
   if (id !== prevId) {

@@ -552,27 +552,49 @@ $('dislike').addEventListener('click', () => setRating('dislike'));
 
 const menu = $('playlist-menu');
 function closeMenu() { menu.hidden = true; }
+
+// The playlist list is fetched when a song starts (and cached for it), so the
+// menu can open fully populated instead of showing an empty box first.
+let options = { id: null, promise: null };
+function loadOptions(id) {
+  if (options.id !== id || !options.promise) {
+    options = { id, promise: invoke('playlist_options', { id }) };
+    options.promise.catch(() => { if (options.id === id) options.promise = null; }); // retry next time
+  }
+  return options.promise;
+}
+
 $('add-to-playlist').addEventListener('click', async (e) => {
   e.stopPropagation();
   if (!menu.hidden) return closeMenu();
   const track = state.now && state.now.track;
   if (!track) return;
-  menu.hidden = false;
-  menu.replaceChildren(h('div', { class: 'menu-head', text: 'Add to playlist' }), h('div', { class: 'muted', text: 'Loading…' }));
+  const button = $('add-to-playlist');
+  button.disabled = true;
+  let list;
   try {
-    const options = await call('playlist_options', { id: track.id });
-    menu.replaceChildren(h('div', { class: 'menu-head', text: 'Add to playlist' }),
-      ...(options.length ? options.map((p) => h('button', {
-        role: 'menuitem', text: p.title,
-        onclick: async () => {
-          closeMenu();
-          const added = await call('add_to_playlist', { playlistId: p.id, videoId: track.id });
-          toast(added ? `Added to ${p.title}` : `Already in ${p.title}`);
-        },
-      })) : [h('div', { class: 'muted', text: 'No playlists of yours found.' })]));
+    list = await loadOptions(track.id);
   } catch (err) {
-    closeMenu();
+    toast(`Could not load your playlists: ${err}`);
+    return;
+  } finally {
+    button.disabled = false;
   }
+  if ((state.now && state.now.track && state.now.track.id) !== track.id) return; // song changed meanwhile
+  if (!list.length) {
+    toast('No playlists of yours found');
+    return;
+  }
+  menu.replaceChildren(h('div', { class: 'menu-head', text: 'Add to playlist' }),
+    ...list.map((p) => h('button', {
+      role: 'menuitem', text: p.title,
+      onclick: async () => {
+        closeMenu();
+        const added = await call('add_to_playlist', { playlistId: p.id, videoId: track.id });
+        toast(added ? `Added to ${p.title}` : `Already in ${p.title}`);
+      },
+    })));
+  menu.hidden = false;
 });
 document.addEventListener('click', (e) => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
@@ -603,6 +625,7 @@ function applyState(now) {
     $('titlebar-title').textContent = t ? `${t.name} — ${(t.artists || []).map((a) => a.name).join(', ')}` : 'TubeDesk';
     closeMenu();
     loadRating(id);
+    if (id && state.loggedIn) loadOptions(id).catch(() => {});
     for (const row of document.querySelectorAll('.track')) row.classList.toggle('current', row.dataset.id === id);
   }
 }

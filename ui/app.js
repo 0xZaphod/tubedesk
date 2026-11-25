@@ -84,6 +84,25 @@ function navigate(route) {
   }
   render(route);
 }
+// ---- custom title bar ------------------------------------------------------------
+
+const appWindow = window.__TAURI__.window.getCurrentWindow();
+$('win-min').addEventListener('click', () => appWindow.minimize());
+$('win-max').addEventListener('click', () => appWindow.toggleMaximize());
+$('win-close').addEventListener('click', () => appWindow.close());
+for (const el of document.querySelectorAll('.resize')) {
+  el.addEventListener('mousedown', (e) => {
+    if (e.button === 0) { e.preventDefault(); appWindow.startResizeDragging(el.dataset.dir); }
+  });
+}
+async function syncMaximized() {
+  const max = await appWindow.isMaximized().catch(() => false);
+  document.body.classList.toggle('maximized', max);
+  $('win-max').title = max ? 'Restore' : 'Maximise';
+}
+appWindow.onResized(syncMaximized);
+syncMaximized();
+
 // Sidebar collapse, remembered per device (localStorage may be unavailable).
 function setSidebar(collapsed) {
   $('app').classList.toggle('sidebar-collapsed', collapsed);

@@ -1,7 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Local UI: app commands plus event listening. No remote page gets IPC access.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "Local UI: app commands, events, and the window controls of the custom title bar. No remote page gets IPC access.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close"
+  ]
 }

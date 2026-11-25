@@ -51,6 +51,17 @@ cargo build --release
 
 Installable bundles: `cargo install tauri-cli --version "^2"` then `cargo tauri build`.
 
+## Desktop integration
+
+- Frameless window with its own title bar: the top row drags the window
+  (double-click maximises), with minimise / maximise / close on the right;
+  the window edges resize it.
+- `./scripts/install-desktop-entry.sh` installs a `.desktop` entry for the
+  local build so the taskbar shows the app icon (on Wayland the taskbar takes
+  the icon from the desktop file, not from the window).
+- The icon is rendered from the Fluent icon theme's `youtube-music.svg`. It is
+  YouTube's trademark: fine for personal use, replace it before publishing.
+
 ## Signing in
 
 Under **Sign in** in the sidebar:

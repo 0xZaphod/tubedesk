@@ -15,7 +15,8 @@
         "width": 1100,
         "height": 760,
         "minWidth": 560,
-        "minHeight": 420
+        "minHeight": 420,
+        "decorations": false
       }
     ],
     "security": {
@@ -24,7 +25,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm", "appimage", "nsis", "dmg"],
+    "targets": [
+      "deb",
+      "rpm",
+      "appimage",
+      "nsis",
+      "dmg"
+    ],
     "category": "Music",
     "shortDescription": "Lightweight, audio-only YouTube Music client",
     "icon": [

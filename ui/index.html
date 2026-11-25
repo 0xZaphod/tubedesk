@@ -9,9 +9,9 @@
 <body>
   <div id="app">
     <nav id="sidebar">
-      <div class="sidebar-head">
+      <div class="sidebar-head" data-tauri-drag-region>
         <button id="sidebar-toggle" class="icon" title="Hide sidebar" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true">☰</button>
-        <span class="brand">TubeDesk</span>
+        <span class="brand" data-tauri-drag-region>TubeDesk</span>
       </div>
       <button class="nav" data-view="home" title="Home"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h5v-6h4v6h5V9.5"/></svg><span class="label">Home</span></button>
       <div class="nav-label">Library</div>
@@ -24,10 +24,23 @@
     </nav>
 
     <main id="main">
-      <header id="topbar">
+      <!-- Custom title bar: the top row drags the window (double-click maximises). -->
+      <header id="topbar" data-tauri-drag-region>
         <form id="search-form">
           <input id="search-input" type="search" placeholder="Search songs, albums, artists" autocomplete="off">
         </form>
+        <div class="drag-fill" data-tauri-drag-region></div>
+        <div class="window-controls">
+          <button id="win-min" class="win-btn" title="Minimise" aria-label="Minimise">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8"/></svg>
+          </button>
+          <button id="win-max" class="win-btn" title="Maximise" aria-label="Maximise">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" rx="1"/></svg>
+          </button>
+          <button id="win-close" class="win-btn close" title="Close" aria-label="Close">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6"/></svg>
+          </button>
+        </div>
       </header>
       <section id="view"></section>
     </main>
@@ -67,6 +80,11 @@
     </footer>
   </div>
   <div id="toast" role="status" hidden></div>
+  <!-- Resize handles (the window has no system frame). -->
+  <div class="resize" data-dir="North"></div><div class="resize" data-dir="South"></div>
+  <div class="resize" data-dir="West"></div><div class="resize" data-dir="East"></div>
+  <div class="resize" data-dir="NorthWest"></div><div class="resize" data-dir="NorthEast"></div>
+  <div class="resize" data-dir="SouthWest"></div><div class="resize" data-dir="SouthEast"></div>
   <script src="app.js"></script>
 </body>
 </html>

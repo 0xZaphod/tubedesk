@@ -75,28 +75,52 @@ pub struct PlaylistOption {
     pub contains: bool,
 }
 
-/// The playlists you can edit, i.e. the "Save to playlist" list, with whether
-/// each already contains the video. Asked as the youtube.com client: only its
-/// answer says which playlists contain the video (YouTube Music's doesn't).
-/// Liked music / Watch later are left out (the Like button covers likes).
-pub async fn playlist_options(rp: &RustyPipe, id: &str) -> Result<Vec<PlaylistOption>, String> {
-    let q = signed(rp)?;
-    let text = q
-        .raw(ClientType::Desktop, "playlist/get_add_to_playlist", &json!({ "videoIds": [id] }))
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp: Value = serde_json::from_str(&text).map_err(|e| format!("unexpected response: {e}"))?;
+fn parse_options(resp: &Value) -> Vec<(String, String, bool)> {
     let mut opts = Vec::new();
-    find_all(&resp, "playlistAddToOptionRenderer", &mut opts);
-    Ok(opts
-        .into_iter()
+    find_all(resp, "playlistAddToOptionRenderer", &mut opts);
+    opts.into_iter()
         .filter_map(|o| {
             let id = o["playlistId"].as_str()?.to_string();
             let title = o["title"]["runs"][0]["text"].as_str().or(o["title"]["simpleText"].as_str())?.to_string();
             let contains = o["containsSelectedVideos"].as_str() == Some("ALL");
-            (!matches!(id.as_str(), "LM" | "WL")).then_some(PlaylistOption { id, title, contains })
+            (!matches!(id.as_str(), "LM" | "WL")).then_some((id, title, contains))
         })
-        .collect())
+        .collect()
+}
+
+/// The playlists you can edit (the "Save to playlist" list), in YouTube
+/// Music's order, with whether each already contains the video. YouTube
+/// Music's answer has the order but not the "contains" state; the youtube.com
+/// client's answer has the state but its own order, so both are asked.
+/// Liked music / Watch later are left out (the Like button covers likes).
+pub async fn playlist_options(rp: &RustyPipe, id: &str) -> Result<Vec<PlaylistOption>, String> {
+    let q = signed(rp)?;
+    let body = json!({ "videoIds": [id] });
+    let (music, web) = tokio::join!(
+        q.raw(ClientType::DesktopMusic, "playlist/get_add_to_playlist", &body),
+        q.raw(ClientType::Desktop, "playlist/get_add_to_playlist", &body),
+    );
+    let parse = |r: Result<String, rustypipe::error::Error>| -> Result<Vec<(String, String, bool)>, String> {
+        let text = r.map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| format!("unexpected response: {e}"))?;
+        Ok(parse_options(&v))
+    };
+    let web = parse(web).unwrap_or_else(|e| {
+        log::debug!("youtube.com playlist list failed: {e}");
+        Vec::new()
+    });
+    let contains: std::collections::HashMap<&str, bool> = web.iter().map(|(id, _, c)| (id.as_str(), *c)).collect();
+    let mut out: Vec<PlaylistOption> = parse(music)?
+        .into_iter()
+        .map(|(id, title, _)| PlaylistOption { contains: contains.get(id.as_str()).copied().unwrap_or(false), id, title })
+        .collect();
+    // Anything only the youtube.com list knows goes last.
+    for (id, title, c) in web {
+        if !out.iter().any(|o| o.id == id) {
+            out.push(PlaylistOption { id, title, contains: c });
+        }
+    }
+    Ok(out)
 }
 
 /// Removes a video from one of your playlists.

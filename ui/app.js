@@ -573,6 +573,16 @@ function closeMenu() { menu.hidden = true; }
 // The playlist list is fetched when a song starts (and cached for it), so the
 // menu can open fully populated instead of showing an empty box first.
 let options = { id: null, promise: null };
+// Your own adds/removes, applied on top of what YouTube reports: right after
+// a change its answer can still be the old state. Key: `${videoId}:${playlistId}`.
+const membership = new Map();
+const MEMBERSHIP_TTL = 10 * 60 * 1000;
+function withLocalChanges(videoId, list) {
+  return list.map((p) => {
+    const m = membership.get(`${videoId}:${p.id}`);
+    return m && Date.now() - m.at < MEMBERSHIP_TTL ? { ...p, contains: m.contains } : p;
+  });
+}
 function loadOptions(id) {
   if (options.id !== id || !options.promise) {
     options = { id, promise: invoke('playlist_options', { id }) };
@@ -590,7 +600,7 @@ $('add-to-playlist').addEventListener('click', async (e) => {
   button.disabled = true;
   let list;
   try {
-    list = await loadOptions(track.id);
+    list = withLocalChanges(track.id, await loadOptions(track.id));
   } catch (err) {
     toast(`Could not load your playlists: ${err}`);
     return;
@@ -609,14 +619,18 @@ $('add-to-playlist').addEventListener('click', async (e) => {
       title: p.contains ? `Remove from ${p.title}` : `Add to ${p.title}`,
       onclick: async () => {
         closeMenu();
-        options.promise = null; // contents change: reload next time
+        const key = `${track.id}:${p.id}`;
         if (p.contains) {
           await call('remove_from_playlist', { playlistId: p.id, videoId: track.id });
+          membership.set(key, { contains: false, at: Date.now() });
           toast(`Removed from ${p.title}`);
         } else {
           const added = await call('add_to_playlist', { playlistId: p.id, videoId: track.id });
+          membership.set(key, { contains: true, at: Date.now() });
           toast(added ? `Added to ${p.title}` : `Already in ${p.title}`);
         }
+        // Refresh in the background (the order may change); local changes stay on top.
+        options.promise = null;
         loadOptions(track.id).catch(() => {});
       },
     }, h('span', { class: 'check', text: p.contains ? '✓' : '' }), h('span', { text: p.title }))));

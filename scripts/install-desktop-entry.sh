@@ -25,6 +25,9 @@ if [ "${1:-}" = "--appimage" ]; then
   mkdir -p "$icon_dir"
   install -m 644 "$root/icons/icon.png" "$icon_dir/dev.tubedesk.app.png"
   icon=dev.tubedesk.app
+  # AppImageLauncher (if installed) intercepts every AppImage start and
+  # spends seconds on it; this entry already integrates the app.
+  exec_path="env APPIMAGELAUNCHER_DISABLE=1 $exec_path"
 fi
 
 write_entry() {

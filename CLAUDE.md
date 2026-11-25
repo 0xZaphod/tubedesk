@@ -16,7 +16,7 @@ cargo build
 cargo test                                   # a few unit tests (resolver); no linters set up
 RUST_LOG=tubedesk=debug cargo run            # normal dev run
 node --check ui/app.js                       # syntax-check the UI after edits
-NO_STRIP=true cargo tauri build --bundles appimage   # release AppImage (~160 MB, bundles GStreamer)
+./scripts/build-appimage.sh                  # release AppImage (~110 MB), curated GStreamer plugins
 
 # Headless/silent test run: search, play the top results, no audio output
 TUBEDESK_AUDIO_SINK="fakesink sync=true" RUST_LOG=tubedesk=debug \
@@ -36,7 +36,9 @@ Testing caveats:
   org.mpris.MediaPlayer2.Player.{PlayPause,Next,Seek int64:…}`.
 - AppImage: its launcher points `LD_LIBRARY_PATH`, `PYTHONHOME` etc. into the
   image; child processes must go through `appimage::host_env` or the system
-  yt-dlp breaks ("<no Python frame>").
+  yt-dlp breaks ("<no Python frame>"). Its mount path changes every start, so
+  `appimage::fix_environment` gives GStreamer a stable symlink + own registry
+  (otherwise a full plugin rescan on every launch).
 - Player position is logged at trace level (`RUST_LOG=tubedesk::player=trace`).
 - Anything that writes to the user's YouTube account (likes, playlist edits)
   must not be exercised in tests; only the read endpoints.

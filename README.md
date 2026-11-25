@@ -24,8 +24,8 @@ AppImage (yt-dlp and deno still come from the system):
 
 ```sh
 cargo install tauri-cli --version "^2"
-NO_STRIP=true cargo tauri build --bundles appimage   # NO_STRIP: linuxdeploy's strip fails on Arch
-./scripts/install-desktop-entry.sh --appimage        # copies it to ~/.local/bin
+./scripts/build-appimage.sh                     # bundles only the GStreamer plugins it needs
+./scripts/install-desktop-entry.sh --appimage   # copies it to ~/.local/bin
 ```
 
 ## Sign-in

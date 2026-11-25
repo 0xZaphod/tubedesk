@@ -14,11 +14,46 @@ fn appdir() -> Option<String> {
 /// sits elsewhere in the image.
 pub fn fix_environment() {
     let Some(dir) = appdir() else { return };
-    let scanner = Path::new(&dir).join("usr/lib/gstreamer-1.0/gst-plugin-scanner");
+    let plugins = Path::new(&dir).join("usr/lib/gstreamer-1.0");
+    let scanner = plugins.join("gst-plugin-scanner");
     let configured = std::env::var_os("GST_PLUGIN_SCANNER_1_0");
     if scanner.exists() && !configured.as_deref().is_some_and(|p| Path::new(p).exists()) {
-        std::env::set_var("GST_PLUGIN_SCANNER_1_0", scanner);
+        std::env::set_var("GST_PLUGIN_SCANNER_1_0", &scanner);
     }
+    if plugins.is_dir() {
+        stable_plugin_path(&plugins);
+    }
+}
+
+/// The image is mounted at a new random path on every start, so GStreamer
+/// would treat every bundled plugin as new and rebuild its registry (several
+/// seconds). Point it at a fixed symlink to the current mount instead, with a
+/// registry of its own (the default one is shared with the host's plugins).
+fn stable_plugin_path(plugins: &Path) {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
+        .map(|c| c.join("dev.tubedesk.app"));
+    let Some(cache) = cache else { return };
+    if std::fs::create_dir_all(&cache).is_err() {
+        return;
+    }
+    let link = cache.join("appimage-gst-plugins");
+    // Plugins are loaded lazily, so a running instance still needs its mount
+    // behind the link: only repoint a link whose mount is gone. (A second
+    // launch just hands over to the running instance and exits.)
+    if !link.exists() {
+        let tmp = cache.join(format!("appimage-gst-plugins.{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        if std::os::unix::fs::symlink(plugins, &tmp).is_err() || std::fs::rename(&tmp, &link).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+    }
+    std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &link);
+    std::env::remove_var("GST_PLUGIN_PATH_1_0");
+    std::env::set_var("GST_REGISTRY_1_0", cache.join("appimage-gst-registry.bin"));
 }
 
 /// Gives a child process the host's environment instead of the image's.

@@ -25,6 +25,8 @@ pub struct Stream {
     pub headers: Vec<(String, String)>,
     pub size: u64,
     pub mime: String,
+    /// Track length in seconds, as reported by yt-dlp.
+    pub duration: Option<f64>,
     fetched: Instant,
 }
 
@@ -49,6 +51,7 @@ struct YtDlpFormat {
     ext: Option<String>,
     format_id: Option<String>,
     abr: Option<f64>,
+    duration: Option<f64>,
 }
 
 /// A *quick* URL for the start of a stream, from rustypipe (~0.1–0.6 s, vs
@@ -114,6 +117,7 @@ pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool, background: bool
         headers: f.http_headers.into_iter().collect(),
         size,
         mime: mime.to_string(),
+        duration: f.duration,
         fetched: Instant::now(),
     })
 }

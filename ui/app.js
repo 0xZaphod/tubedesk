@@ -638,7 +638,8 @@ function applyState(now) {
   const hold = state.seekHold;
   if (hold && (Date.now() > hold.until || Math.abs(now.position - hold.target) < 2)) state.seekHold = null;
   if (!state.seeking && !state.seekHold) {
-    seek.max = Math.max(1, Math.floor(now.duration));
+    // Never shorter than the position (unknown length would pin it at the end).
+    seek.max = Math.max(1, Math.floor(now.duration), Math.ceil(now.position));
     seek.value = Math.floor(now.position);
     $('pos').textContent = fmt(now.position);
   }

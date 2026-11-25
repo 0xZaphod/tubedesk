@@ -101,6 +101,10 @@ struct Session {
     tracks: Vec<TrackItem>,
     index: Option<usize>,
     position: f64,
+    /// Length as reported by the player: many tracks (e.g. from the home
+    /// feed) carry no duration of their own.
+    #[serde(default)]
+    duration: f64,
 }
 
 struct Core {
@@ -301,6 +305,18 @@ impl Core {
             CoreMsg::Resolved { id, result } => {
                 self.inflight.remove(&id);
                 let wanted = self.awaiting.as_deref() == Some(id.as_str());
+                // Fill in a missing length for the shown track (e.g. a restored
+                // session or a home-feed track without duration).
+                if let Ok(stream) = &result {
+                    let shown = self.now.track.as_ref().is_some_and(|t| t.id == id);
+                    if shown && self.now.duration <= 0.0 {
+                        if let Some(d) = stream.duration.filter(|d| *d > 0.0) {
+                            log::debug!("{id}: length {d:.0}s from yt-dlp");
+                            self.now.duration = d;
+                            self.emit_state();
+                        }
+                    }
+                }
                 match result {
                     Ok(stream) => {
                         self.cache_stream(id.clone(), stream.clone());
@@ -597,7 +613,12 @@ impl Core {
     }
 
     fn save_session(&self) {
-        let s = Session { tracks: self.queue.clone(), index: self.index, position: self.now.position };
+        let s = Session {
+            tracks: self.queue.clone(),
+            index: self.index,
+            position: self.now.position,
+            duration: self.now.duration,
+        };
         match serde_json::to_vec(&s) {
             Ok(b) => {
                 if let Err(e) = std::fs::write(&self.cfg.session_path, b) {
@@ -622,8 +643,9 @@ impl Core {
         self.queue = s.tracks;
         self.index = Some(i);
         self.restored = true;
+        let duration = if s.duration > 0.0 { s.duration } else { track.duration.unwrap_or(0) as f64 };
         self.now = NowPlaying {
-            duration: track.duration.unwrap_or(0) as f64,
+            duration,
             track: Some(track),
             index: Some(i),
             position: s.position,

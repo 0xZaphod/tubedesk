@@ -1,33 +1,52 @@
 //! Local HTTP proxy between GStreamer and googlevideo.com.
 //!
-//! Upstream requests carry the headers yt-dlp says the URL needs.
-//!
 //! YouTube answers 403 to stream requests that don't ask for a byte range, and
 //! throttles large ones. GStreamer's first request has no range, so it talks to
 //! `http://127.0.0.1:<port>/s/<id>` instead, and this proxy fetches the
 //! upstream URL in ranged chunks (`&range=a-b`, like yt-dlp does). Seeking
 //! works because incoming `Range:` headers are honoured.
 //!
-//! Upcoming tracks are *warmed*: their first chunk is fetched in the
-//! background (waiting out YouTube's ~2 s 403 phase for new URLs) and kept in
-//! memory, so they start instantly when played.
+//! Each stream can have two upstream URLs for the *same file*:
+//! - the **full** URL from yt-dlp (with the headers it needs). It is refused
+//!   (403) for ~3 s after being issued, then serves the whole file.
+//! - a **quick** URL from rustypipe's iOS client, available instantly but only
+//!   for the first ~500 KB (no PO token). It lets a song start right away
+//!   while the full URL is still being looked up / warming up.
+//!
+//! Upcoming tracks are also *warmed*: their first chunk is fetched in the
+//! background and kept in memory, so they start instantly when played.
 
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const CHUNK: u64 = 1 << 20; // 1 MiB per upstream request
 const RETRIES: u32 = 12;
-const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Streams kept registered (current, prefetched, recently played).
 const MAX_STREAMS: usize = 24; // at most ~24 MiB of warmed starts
+/// Quick (iOS) URLs serve bytes below this offset; YouTube refuses more
+/// without a PO token (tested limit ~500 KB, kept with a margin).
+pub const QUICK_LIMIT: u64 = 450_000;
+/// A full URL is refused this long after being issued.
+const FULL_WARMUP: Duration = Duration::from_millis(3500);
+/// How long a request past the quick part waits for the full URL to arrive.
+const FULL_WAIT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct Full {
+    url: String,
+    headers: Vec<(String, String)>,
+    registered: Instant,
+}
 
 #[derive(Clone)]
 struct Upstream {
-    url: String,
-    headers: Vec<(String, String)>,
+    full: Option<Full>,
+    quick: Option<String>,
     size: u64,
     mime: String,
     /// First bytes of the stream, fetched ahead of time by [`StreamProxy::warm`].
@@ -39,6 +58,17 @@ struct Streams {
     map: HashMap<String, Upstream>,
     /// Registration order, oldest first, for eviction.
     order: Vec<String>,
+}
+
+impl Streams {
+    fn touch(&mut self, id: &str) {
+        self.order.retain(|x| x != id);
+        self.order.push(id.to_string());
+        while self.order.len() > MAX_STREAMS {
+            let old = self.order.remove(0);
+            self.map.remove(&old);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -56,7 +86,7 @@ impl StreamProxy {
             port,
             streams: Arc::default(),
             http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .expect("http client"),
         };
@@ -80,37 +110,69 @@ impl StreamProxy {
         Ok(proxy)
     }
 
-    /// Registers an upstream stream and returns the local URL for GStreamer.
-    /// Re-registering the same URL keeps its warmed head. Only the most recent
-    /// [`MAX_STREAMS`] are kept.
+    fn local_url(&self, id: &str) -> String {
+        format!("http://127.0.0.1:{}/s/{}", self.port, id)
+    }
+
+    /// Registers the full (yt-dlp) URL of a stream and returns the local URL
+    /// for GStreamer. Re-registering the same URL keeps its warmed head; a
+    /// quick URL registered earlier is kept if the file sizes match.
     pub fn register(&self, id: &str, s: &crate::resolver::Stream) -> String {
         let mut st = self.streams.lock().unwrap();
-        let same = st.map.get(id).is_some_and(|u| u.url == s.url);
-        if !same {
-            st.map.insert(
-                id.to_string(),
-                Upstream { url: s.url.clone(), headers: s.headers.clone(), size: s.size, mime: s.mime.clone(), head: None },
-            );
+        let full = Full { url: s.url.clone(), headers: s.headers.clone(), registered: Instant::now() };
+        match st.map.get_mut(id) {
+            Some(u) if u.full.as_ref().is_some_and(|f| f.url == s.url) => {}
+            Some(u) => {
+                if u.size != s.size {
+                    // Not the same file as the quick URL: never mix their bytes.
+                    log::warn!("{id}: quick and full streams differ in size ({} vs {}); dropping quick", u.size, s.size);
+                    u.quick = None;
+                    u.head = None;
+                    u.size = s.size;
+                    u.mime = s.mime.clone();
+                }
+                if u.full.is_some() {
+                    u.head = None; // a different full URL: its warmed head is stale
+                }
+                u.full = Some(full);
+            }
+            None => {
+                st.map.insert(
+                    id.to_string(),
+                    Upstream { full: Some(full), quick: None, size: s.size, mime: s.mime.clone(), head: None },
+                );
+            }
         }
-        st.order.retain(|x| x != id);
-        st.order.push(id.to_string());
-        while st.order.len() > MAX_STREAMS {
-            let old = st.order.remove(0);
-            st.map.remove(&old);
+        st.touch(id);
+        self.local_url(id)
+    }
+
+    /// Registers a quick (iOS) URL for the start of a stream, so playback can
+    /// begin before the full URL is ready. Returns the local URL.
+    pub fn register_quick(&self, id: &str, url: String, size: u64, mime: String) -> String {
+        let mut st = self.streams.lock().unwrap();
+        match st.map.get_mut(id) {
+            Some(u) if u.size == size => u.quick = Some(url),
+            Some(_) => log::warn!("{id}: quick stream size differs from the full one; not using it"),
+            None => {
+                st.map.insert(id.to_string(), Upstream { full: None, quick: Some(url), size, mime, head: None });
+            }
         }
-        format!("http://127.0.0.1:{}/s/{}", self.port, id)
+        st.touch(id);
+        self.local_url(id)
     }
 
     /// Fetches and keeps the first chunk of a registered stream so that
     /// playing it later starts immediately.
     pub async fn warm(&self, id: &str) {
         let Some(up) = self.streams.lock().unwrap().map.get(id).cloned() else { return };
+        let Some(full) = up.full.clone() else { return };
         if up.head.is_some() || up.size == 0 {
             return;
         }
         let end = (CHUNK - 1).min(up.size - 1);
-        let url = format!("{}&range=0-{end}", up.url);
-        let bytes = match self.fetch(&up, &url).await {
+        let url = format!("{}&range=0-{end}", full.url);
+        let bytes = match self.fetch(&full.headers, &url, RETRIES).await {
             Ok(Some(resp)) => match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => return log::debug!("warming {id} failed: {e}"),
@@ -118,18 +180,18 @@ impl StreamProxy {
             _ => return log::debug!("warming {id} failed"),
         };
         let mut st = self.streams.lock().unwrap();
-        if let Some(u) = st.map.get_mut(id).filter(|u| u.url == up.url) {
+        if let Some(u) = st.map.get_mut(id).filter(|u| u.full.as_ref().is_some_and(|f| f.url == full.url)) {
             log::debug!("warmed {id}: {} bytes ready", bytes.len());
             u.head = Some(Arc::new(bytes.to_vec()));
         }
     }
 
-    /// GETs one chunk. Freshly issued stream URLs answer 403 for the first
-    /// ~2 seconds, so 403 and 5xx are retried for a few seconds.
-    async fn fetch(&self, up: &Upstream, url: &str) -> std::io::Result<Option<reqwest::Response>> {
-        for attempt in 0..RETRIES {
+    /// GETs one chunk. Freshly issued full URLs answer 403 for the first ~3 s,
+    /// so 403 and 5xx are retried up to `retries` times.
+    async fn fetch(&self, headers: &[(String, String)], url: &str, retries: u32) -> std::io::Result<Option<reqwest::Response>> {
+        for attempt in 0..retries {
             let mut req = self.http.get(url);
-            for (k, v) in &up.headers {
+            for (k, v) in headers {
                 req = req.header(k, v);
             }
             let resp = req.send().await.map_err(std::io::Error::other)?;
@@ -141,10 +203,26 @@ impl StreamProxy {
                 log::warn!("upstream returned {status}");
                 return Ok(None);
             }
-            log::debug!("upstream returned {status}, retrying ({})", attempt + 1);
-            tokio::time::sleep(RETRY_DELAY).await;
+            if attempt + 1 < retries {
+                log::debug!("upstream returned {status}, retrying ({})", attempt + 1);
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
         }
         Ok(None)
+    }
+
+    /// The full URL of `id`, waiting (up to [`FULL_WAIT`]) for it to arrive.
+    async fn wait_full(&self, id: &str) -> Option<Full> {
+        let until = Instant::now() + FULL_WAIT;
+        loop {
+            if let Some(f) = self.streams.lock().unwrap().map.get(id).and_then(|u| u.full.clone()) {
+                return Some(f);
+            }
+            if Instant::now() > until {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn serve(&self, mut sock: TcpStream) -> std::io::Result<()> {
@@ -169,8 +247,8 @@ impl StreamProxy {
             .find(|(k, _)| k.trim().eq_ignore_ascii_case("range"))
             .map(|(_, v)| v.trim().to_string());
 
-        let id = path.strip_prefix("/s/").unwrap_or_default();
-        let Some(up) = self.streams.lock().unwrap().map.get(id).cloned() else {
+        let id = path.strip_prefix("/s/").unwrap_or_default().to_string();
+        let Some(up) = self.streams.lock().unwrap().map.get(&id).cloned() else {
             sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
             return Ok(());
         };
@@ -215,20 +293,60 @@ impl StreamProxy {
         }
 
         let mut pos = start;
-        // Serve what was fetched ahead of time, then continue upstream.
-        if let Some(head) = &up.head {
-            if (pos as usize) < head.len() {
-                let stop = head.len().min(end as usize + 1);
-                sock.write_all(&head[pos as usize..stop]).await?;
-                pos = stop as u64;
-            }
-        }
         while pos <= end {
+            // Re-read each round: the full URL or a warmed head may arrive meanwhile.
+            let Some(up) = self.streams.lock().unwrap().map.get(&id).cloned() else { return Ok(()) };
+
+            // 1. Bytes fetched ahead of time.
+            if let Some(head) = &up.head {
+                if (pos as usize) < head.len() {
+                    let stop = head.len().min(end as usize + 1);
+                    sock.write_all(&head[pos as usize..stop]).await?;
+                    pos = stop as u64;
+                    continue;
+                }
+            }
+
+            // 2. The quick URL, for the start of the file while the full URL
+            //    is missing or still in its warm-up.
+            let full_open = up.full.as_ref().is_some_and(|f| f.registered.elapsed() > FULL_WARMUP);
+            if pos < QUICK_LIMIT && !full_open {
+                if let Some(quick) = &up.quick {
+                    let chunk_end = (QUICK_LIMIT - 1).min(end);
+                    log::debug!("upstream {id}: bytes {pos}-{chunk_end} (quick)");
+                    let url = format!("{quick}&range={pos}-{chunk_end}");
+                    match self.fetch(&[], &url, 1).await? {
+                        Some(resp) => {
+                            let mut body = resp.bytes_stream();
+                            while let Some(bytes) = body.next().await {
+                                let bytes = bytes.map_err(std::io::Error::other)?;
+                                sock.write_all(&bytes).await?;
+                                pos += bytes.len() as u64;
+                            }
+                            if pos <= chunk_end {
+                                return Ok(()); // upstream ended early
+                            }
+                        }
+                        None => {
+                            log::debug!("{id}: quick URL refused at {pos}; using the full URL");
+                            if let Some(u) = self.streams.lock().unwrap().map.get_mut(&id) {
+                                u.quick = None;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // 3. The full URL (waiting for it if it isn't known yet).
+            let Some(full) = self.wait_full(&id).await else {
+                log::warn!("{id}: no full stream URL arrived");
+                return Ok(());
+            };
             let chunk_end = (pos + CHUNK - 1).min(end);
-            let url = format!("{}&range={pos}-{chunk_end}", up.url);
+            let url = format!("{}&range={pos}-{chunk_end}", full.url);
             log::debug!("upstream {id}: bytes {pos}-{chunk_end}");
-            let resp = self.fetch(&up, &url).await?;
-            let Some(resp) = resp else {
+            let Some(resp) = self.fetch(&full.headers, &url, RETRIES).await? else {
                 log::warn!("upstream kept refusing {id} at byte {pos}");
                 return Ok(());
             };

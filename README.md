@@ -15,6 +15,9 @@ loaded, there are no ads to block.
 - Audio-only playback through GStreamer: Opus, best or smallest stream
 - Queue with play next, add to queue and remove. When the queue runs out it
   continues with YouTube Music's radio for the last track.
+- Songs start in under a second even when nothing was prepared: the first
+  ~450 KB come from rustypipe's instantly usable URL while yt-dlp's full URL
+  is looked up and warms up, then the proxy switches over (same file, itag 251)
 - The next track is resolved in advance, so skipping is instant
 - Remembers the queue, the last song and its position; restored paused at start
   and resumed with Play (`~/.local/share/dev.tubedesk.app/session.json`)

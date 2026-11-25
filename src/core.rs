@@ -48,6 +48,8 @@ pub enum CoreMsg {
     Volume(f64),
     Player(PlayerEvent),
     Resolved { id: String, result: Result<Stream, String> },
+    /// A quick URL for the start of `id` (see `resolver::quick`).
+    QuickResolved { id: String, url: String, size: u64, mime: String },
     RadioLoaded { for_id: String, tracks: Vec<TrackItem> },
     Sync,
 }
@@ -289,6 +291,13 @@ impl Core {
                 self.emit_state();
                 self.emit_queue();
             }
+            CoreMsg::QuickResolved { id, url, size, mime } => {
+                if self.awaiting.as_deref() == Some(id.as_str()) {
+                    log::debug!("{id}: starting from the quick URL");
+                    let uri = self.proxy.register_quick(&id, url, size, mime);
+                    self.load_uri(uri);
+                }
+            }
             CoreMsg::Resolved { id, result } => {
                 self.inflight.remove(&id);
                 let wanted = self.awaiting.as_deref() == Some(id.as_str());
@@ -398,6 +407,14 @@ impl Core {
             None => {
                 self.awaiting = Some(track.id.clone());
                 self.request_now(&track.id);
+                // Start from a quick URL meanwhile; yt-dlp's full URL takes over.
+                let (rp, me, id, hq) = (self.rp.clone(), self.me.clone(), track.id.clone(), self.cfg.high_quality);
+                tauri::async_runtime::spawn(async move {
+                    match resolver::quick(&rp, &id, hq).await {
+                        Ok((url, size, mime)) => me.send(CoreMsg::QuickResolved { id, url, size, mime }),
+                        Err(e) => log::debug!("{id}: no quick URL ({e})"),
+                    }
+                });
             }
         }
         self.prefetch_ahead(i);
@@ -466,6 +483,11 @@ impl Core {
     fn load(&mut self, id: &str, stream: &Stream) {
         self.awaiting = None;
         let uri = self.proxy.register(id, stream);
+        self.load_uri(uri);
+    }
+
+    fn load_uri(&mut self, uri: String) {
+        self.awaiting = None;
         self.player.send(match self.pending_seek.take() {
             Some(pos) => PlayerCmd::LoadAt(uri, pos),
             None => PlayerCmd::Load(uri),

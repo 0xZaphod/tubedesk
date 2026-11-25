@@ -51,13 +51,30 @@ struct YtDlpFormat {
     abr: Option<f64>,
 }
 
+/// A *quick* URL for the start of a stream, from rustypipe (~0.1–0.6 s, vs
+/// ~2.5 s for yt-dlp plus ~3 s until its URL is accepted). Without a PO
+/// token YouTube only serves the first ~500 KB of it, but that is ~30 s of
+/// audio: plenty of time for the full URL to take over (see `proxy`).
+/// Returns (url, size, mime) of the same itag `resolve` asks yt-dlp for.
+pub async fn quick(rp: &rustypipe::client::RustyPipe, id: &str, high_quality: bool) -> Result<(String, u64, String), String> {
+    let itag = if high_quality { 251 } else { 249 };
+    let player = rp.query().unauthenticated().player(id).await.map_err(|e| e.to_string())?;
+    let s = player
+        .audio_streams
+        .iter()
+        .find(|s| s.itag == itag && s.drm_track_type.is_none())
+        .ok_or_else(|| format!("no itag {itag} stream"))?;
+    Ok((s.url.clone(), s.size, s.mime.clone()))
+}
+
 /// `background`: wait for one of the limited background slots first.
 pub async fn resolve(ytdlp: &str, id: &str, high_quality: bool, background: bool) -> Result<Stream, String> {
     let _permit = if background { Some(BACKGROUND.acquire().await.map_err(|e| e.to_string())?) } else { None };
+    // Prefer the exact itag `quick` uses, so its bytes and ours are the same file.
     let format = if high_quality {
-        "bestaudio[acodec=opus]/bestaudio"
+        "251/bestaudio[acodec=opus]/bestaudio"
     } else {
-        "worstaudio[acodec=opus]/worstaudio"
+        "249/worstaudio[acodec=opus]/worstaudio"
     };
     let url = format!("https://music.youtube.com/watch?v={id}");
     let out = Command::new(ytdlp)

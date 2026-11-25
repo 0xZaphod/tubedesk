@@ -136,7 +136,9 @@ function trackList(tracks) {
   return h('ol', { class: 'tracks' }, tracks.map((t, i) => h('li', {
     class: `track${t.id === playingId ? ' current' : ''}`,
     'data-id': t.id,
-    ondblclick: () => call('play', { tracks, start: i }),
+    // The title link plays on single click; double-clicking elsewhere on the row
+    // plays too. Never both, or one double-click on the title would play 3 times.
+    ondblclick: (e) => { if (!e.target.closest('.link, button')) call('play', { tracks, start: i }); },
   },
     img(t.cover),
     h('div', { class: 'ellipsis' },

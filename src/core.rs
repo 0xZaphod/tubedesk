@@ -36,8 +36,7 @@ pub enum CoreMsg {
     SeekTo(f64),
     Volume(f64),
     Player(PlayerEvent),
-    Resolved { gen: u64, id: String, result: Result<Stream, String> },
-    Prefetched { id: String, stream: Stream },
+    Resolved { id: String, result: Result<Stream, String> },
     RadioLoaded { for_id: String, tracks: Vec<TrackItem> },
     Sync,
 }
@@ -89,7 +88,10 @@ struct Core {
     queue: Vec<TrackItem>,
     index: Option<usize>,
     now: NowPlaying,
-    gen: u64,
+    /// Track id the current track is waiting on to be resolved (not loaded yet).
+    awaiting: Option<String>,
+    /// Ids with a yt-dlp lookup in flight, so each id is resolved at most once at a time.
+    inflight: std::collections::HashSet<String>,
     consecutive_errors: u32,
     radio_requested_for: Option<String>,
     /// Resolved stream URLs by video id (current + prefetched next track).
@@ -118,7 +120,8 @@ pub fn spawn(
         cfg,
         queue: Vec::new(),
         index: None,
-        gen: 0,
+        awaiting: None,
+        inflight: Default::default(),
         consecutive_errors: 0,
         radio_requested_for: None,
         streams: HashMap::new(),
@@ -196,17 +199,23 @@ impl Core {
                 self.emit_state();
                 self.emit_queue();
             }
-            CoreMsg::Resolved { gen, id, result } => match result {
-                Ok(stream) => {
-                    self.cache_stream(id.clone(), stream.clone());
-                    if gen == self.gen {
-                        self.load(&id, &stream);
+            CoreMsg::Resolved { id, result } => {
+                self.inflight.remove(&id);
+                let wanted = self.awaiting.as_deref() == Some(id.as_str());
+                match result {
+                    Ok(stream) => {
+                        self.cache_stream(id.clone(), stream.clone());
+                        if wanted {
+                            self.load(&id, &stream);
+                        }
                     }
+                    Err(e) if wanted => {
+                        self.awaiting = None;
+                        self.failed(e);
+                    }
+                    Err(e) => log::debug!("background resolve of {id} failed: {e}"),
                 }
-                Err(e) if gen == self.gen => self.failed(e),
-                Err(_) => {} // stale: user already skipped
-            },
-            CoreMsg::Prefetched { id, stream } => self.cache_stream(id, stream),
+            }
             CoreMsg::RadioLoaded { for_id, tracks } => {
                 let known: std::collections::HashSet<_> = self.queue.iter().map(|t| t.id.clone()).collect();
                 let new: Vec<_> = tracks.into_iter().filter(|t| t.id != for_id && !known.contains(&t.id)).collect();
@@ -249,7 +258,7 @@ impl Core {
     }
 
     fn stop(&mut self) {
-        self.gen += 1;
+        self.awaiting = None;
         self.player.send(PlayerCmd::Stop);
         self.index = None;
         self.now = NowPlaying { volume: self.now.volume, ..Default::default() };
@@ -258,8 +267,12 @@ impl Core {
 
     fn start_at(&mut self, i: usize) {
         let Some(track) = self.queue.get(i).cloned() else { return };
-        self.gen += 1;
-        let gen = self.gen;
+        // Repeated play requests for a track that is still starting up (e.g. a
+        // double-click) must not restart it.
+        if self.index == Some(i) && self.now.loading && self.now.track.as_ref().map(|t| &t.id) == Some(&track.id) {
+            return;
+        }
+        self.awaiting = None;
         self.index = Some(i);
         self.player.send(PlayerCmd::Stop);
         self.now = NowPlaying {
@@ -273,15 +286,13 @@ impl Core {
         self.emit_state();
         self.emit_queue();
 
-        // Play right away if the stream was prefetched, else resolve it off the actor.
+        // Play right away if the stream was prefetched, else wait for (possibly
+        // already running) resolve.
         match self.streams.get(&track.id).filter(|s| s.is_fresh()).cloned() {
             Some(stream) => self.load(&track.id, &stream),
             None => {
-                let (me, ytdlp, hq, id) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality, track.id.clone());
-                tauri::async_runtime::spawn(async move {
-                    let result = resolver::resolve(&ytdlp, &id, hq).await;
-                    me.send(CoreMsg::Resolved { gen, id, result });
-                });
+                self.awaiting = Some(track.id.clone());
+                self.request(&track.id);
             }
         }
         self.prefetch(i + 1);
@@ -339,6 +350,7 @@ impl Core {
     }
 
     fn load(&mut self, id: &str, stream: &Stream) {
+        self.awaiting = None;
         let uri = self.proxy.register(id, stream);
         self.player.send(PlayerCmd::Load(uri));
     }
@@ -353,16 +365,21 @@ impl Core {
 
     /// Resolves the track at `i` in the background so skipping to it is instant.
     fn prefetch(&mut self, i: usize) {
-        let Some(track) = self.queue.get(i) else { return };
-        if self.streams.get(&track.id).is_some_and(|s| s.is_fresh()) {
+        let Some(id) = self.queue.get(i).map(|t| t.id.clone()) else { return };
+        if !self.streams.get(&id).is_some_and(|s| s.is_fresh()) {
+            self.request(&id);
+        }
+    }
+
+    /// Starts a yt-dlp lookup for `id` unless one is already running.
+    fn request(&mut self, id: &str) {
+        if !self.inflight.insert(id.to_string()) {
             return;
         }
-        let (me, ytdlp, hq, id) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality, track.id.clone());
+        let (me, ytdlp, hq, id) = (self.me.clone(), self.cfg.ytdlp.clone(), self.cfg.high_quality, id.to_string());
         tauri::async_runtime::spawn(async move {
-            match resolver::resolve(&ytdlp, &id, hq).await {
-                Ok(stream) => me.send(CoreMsg::Prefetched { id, stream }),
-                Err(e) => log::debug!("prefetch of {id} failed: {e}"),
-            }
+            let result = resolver::resolve(&ytdlp, &id, hq).await;
+            me.send(CoreMsg::Resolved { id, result });
         });
     }
 

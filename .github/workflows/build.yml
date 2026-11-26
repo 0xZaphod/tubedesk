@@ -60,6 +60,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # linuxdeploy's strip can fail on newer binaries; stripping is done by cargo anyway.
           NO_STRIP: "true"
+          # Signs the update files; the app checks them against the public key
+          # in tauri.conf.json. tauri-action also uploads latest.json, which
+          # installed copies check for new versions.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tauriScript: npx --yes @tauri-apps/cli@2
           args: ${{ matrix.args }}

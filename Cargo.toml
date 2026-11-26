@@ -24,6 +24,7 @@ env_logger = "0.11"
 symphonia = { version = "0.5", default-features = false, features = ["mkv"] }
 opus = "0.3"
 cpal = "0.15"
+tauri-plugin-updater = "2"
 
 [profile.release]
 codegen-units = 1

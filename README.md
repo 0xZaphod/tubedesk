@@ -41,6 +41,9 @@ cargo install tauri-cli --version "^2"
 ./scripts/install-desktop-entry.sh --appimage   # copies it to ~/.local/bin
 ```
 
+Installed copies update themselves (Windows, macOS, AppImage; a `.deb`/`.rpm`
+install only gets a link to the new release).
+
 Windows and macOS builds are made by GitHub Actions (`.github/workflows/build.yml`):
 push a `v*` tag for a draft release, or run the workflow by hand. The builds
 are unsigned, so Windows SmartScreen and macOS Gatekeeper warn on first start

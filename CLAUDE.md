@@ -43,6 +43,14 @@ Testing caveats:
   PATH on macOS).
 - libopus: system copy via pkg-config on Linux; built from source with CMake
   elsewhere (`.cargo/config.toml` sets the CMake policy CMake 4 needs).
+- Updates (`update.rs`, Tauri updater): releases are signed in CI with the
+  `TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)` repo secrets; the key pair lives in
+  `~/.tauri/tubedesk.key*` (public key in `tauri.conf.json`; losing the
+  private key strands installed copies). Local building needs both env vars
+  (`createUpdaterArtifacts`). Test without a release: build the "old" app
+  with `--config '{"plugins":{"updater":{"dangerousInsecureTransportProtocol":true}}}'`,
+  serve a `latest.json` over http, run it with
+  `TUBEDESK_UPDATE_URL=http://…/latest.json … --update` (installs and restarts).
 - Player position is logged at trace level (`RUST_LOG=tubedesk::player=trace`).
 - Anything that writes to the user's YouTube account (likes, playlist edits)
   must not be exercised in tests; only the read endpoints.

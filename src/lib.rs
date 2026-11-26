@@ -7,6 +7,7 @@ mod home;
 mod media;
 mod player;
 mod process;
+mod update;
 mod proxy;
 mod resolver;
 
@@ -426,6 +427,35 @@ struct Settings {
     /// Takes effect after a restart.
     media_controls: bool,
     ytdlp: String,
+    check_updates: bool,
+    /// This build's version (shown only; ignored when saving).
+    #[serde(default, skip_deserializing)]
+    version: String,
+}
+
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
+async fn update_check(handle: AppHandle) -> Res<Option<update::UpdateInfo>> {
+    update::check(&handle).await
+}
+
+#[tauri::command]
+async fn update_install(handle: AppHandle, app: State<'_, App>) -> Res<()> {
+    update::install(&handle, &app.core).await
+}
+
+/// For installs that can't update themselves: the releases page in the browser.
+#[tauri::command]
+async fn open_releases() -> Res<()> {
+    let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let mut cmd = tokio::process::Command::new(opener);
+    process::host_command(&mut cmd);
+    cmd.arg(update::RELEASES_URL).spawn().map_err(|e| format!("could not open the browser: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -438,6 +468,8 @@ fn settings(app: State<'_, App>) -> Settings {
         hide_on_close: c.hide_on_close,
         media_controls: c.media_controls,
         ytdlp: c.ytdlp.clone(),
+        check_updates: c.check_updates,
+        version: app_version(),
     }
 }
 
@@ -454,6 +486,7 @@ async fn set_settings(app: State<'_, App>, settings: Settings) -> Res<()> {
         c.hide_on_close = settings.hide_on_close;
         c.media_controls = settings.media_controls;
         c.ytdlp = ytdlp.clone();
+        c.check_updates = settings.check_updates;
     });
     app.core.send(CoreMsg::Settings(CoreSettings {
         high_quality: settings.high_quality,
@@ -718,6 +751,22 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // `tubedesk --update`: install an available update without the UI, then restart.
+    if args.iter().any(|a| a == "--update") {
+        let (h, core) = (handle.clone(), core.clone());
+        tauri::async_runtime::spawn(async move {
+            match update::install(&h, &core).await {
+                Ok(()) => {}
+                Err(e) => log::warn!("--update: {e}"),
+            }
+        });
+    } else {
+        let h = handle.clone();
+        update::spawn_checks(handle.clone(), move || {
+            h.try_state::<App>().is_some_and(|a| a.config.lock().unwrap().check_updates)
+        });
+    }
+
     build_tray(&handle, core.clone())?;
     app.manage(App {
         rp,
@@ -737,10 +786,11 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,
             play, play_list, prepare_list, set_shuffle, set_repeat, settings, set_settings, seek_by, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, track_rating, rate_track, playlist_options, add_to_playlist, remove_from_playlist, control, seek, set_volume, sync,
-            auth_status, auth_login, auth_logout,
+            auth_status, auth_login, auth_logout, update_check, update_install, open_releases,
         ])
         .setup(setup)
         .build(tauri::generate_context!())

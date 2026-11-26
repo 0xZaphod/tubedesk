@@ -26,6 +26,8 @@ pub struct Config {
     /// User agent for the Google sign-in window (None = webview default).
     /// Try a desktop Firefox/Safari UA if Google refuses to sign in.
     pub login_user_agent: Option<String>,
+    /// Look for new TubeDesk releases (on start and every few hours).
+    pub check_updates: bool,
     /// yt-dlp executable used to resolve audio streams.
     pub ytdlp: String,
     #[serde(skip)]
@@ -48,6 +50,7 @@ impl Default for Config {
             media_controls: true,
             hide_on_close: false,
             login_user_agent: None,
+            check_updates: true,
             ytdlp: "yt-dlp".into(),
             path: PathBuf::new(),
             writable: true,

@@ -119,7 +119,7 @@ function setSidebar(collapsed) {
 }
 $('sidebar-toggle').addEventListener('click', () => setSidebar(!$('app').classList.contains('sidebar-collapsed')));
 try { setSidebar(localStorage.getItem('sidebarCollapsed') === '1'); } catch (e) { setSidebar(false); }
-for (const b of document.querySelectorAll('.nav')) {
+for (const b of document.querySelectorAll('.nav[data-view]')) {
   b.addEventListener('click', () => navigate({ name: b.dataset.view }));
 }
 $('search-form').addEventListener('submit', (e) => {
@@ -730,6 +730,41 @@ function applyModes(now) {
   $('repeat').querySelector('.badge').hidden = repeat !== 'one';
 }
 
+// ---- updates ------------------------------------------------------------------------
+// The sidebar shows "Update to x.y" when a new version is out. Installing
+// downloads, verifies and installs it, then the app restarts (the queue and
+// position are kept). Installs that can't update themselves (Linux packages)
+// open the releases page instead.
+
+const updateBtn = $('update-btn');
+const update = { info: null, installing: false };
+function setUpdateLabel(text) { updateBtn.querySelector('.label').textContent = text; }
+function showUpdate(info) {
+  if (update.installing) return;
+  update.info = info || null;
+  updateBtn.hidden = !info;
+  if (!info) return;
+  setUpdateLabel(`Update to ${info.version}`);
+  updateBtn.title = info.installable
+    ? `Install TubeDesk ${info.version} and restart (music stops for a moment)`
+    : `TubeDesk ${info.version} is available: open the download page`;
+}
+updateBtn.addEventListener('click', async () => {
+  const info = update.info;
+  if (!info || update.installing) return;
+  if (!info.installable) { call('open_releases'); return; }
+  update.installing = true;
+  updateBtn.setAttribute('aria-busy', 'true');
+  setUpdateLabel('Updating…');
+  try {
+    await call('update_install'); // restarts the app when it succeeds
+  } catch (e) {
+    update.installing = false;
+    updateBtn.removeAttribute('aria-busy');
+    showUpdate(info);
+  }
+});
+
 // ---- keyboard shortcuts ------------------------------------------------------------
 
 const SHORTCUTS = [
@@ -799,6 +834,14 @@ async function renderSettings() {
       h('div', { class: 'setting-text' }, h('div', { class: 'setting-title', text: title }), h('div', { class: 'setting-desc muted', text: desc })),
       box);
   };
+  const checkNow = h('button', { class: 'btn secondary', text: 'Check now', onclick: async () => {
+    checkNow.disabled = true;
+    try {
+      const info = await call('update_check');
+      showUpdate(info);
+      toast(info ? `TubeDesk ${info.version} is available` : 'TubeDesk is up to date');
+    } finally { checkNow.disabled = false; }
+  } });
   const ytdlp = h('input', { type: 'text', spellcheck: 'false', 'aria-label': 'yt-dlp command' });
   ytdlp.value = current.ytdlp;
   ytdlp.addEventListener('change', () => save({ ytdlp: ytdlp.value.trim() }, () => { ytdlp.value = current.ytdlp; }));
@@ -813,6 +856,12 @@ async function renderSettings() {
       h('h2', { text: 'Window' }),
       toggle('hide_on_close', 'Close to tray', 'The close button hides the window and the music keeps playing. Quit from the tray icon.'),
       toggle('media_controls', 'Media keys and system controls', 'Show TubeDesk in the system\'s media controls (MPRIS). Takes effect after a restart.'),
+      h('h2', { text: 'Updates' }),
+      toggle('check_updates', 'Check for updates automatically', 'Look for a new TubeDesk version on start and every few hours. Updating is always your choice.'),
+      h('div', { class: 'setting' },
+        h('div', { class: 'setting-text' }, h('div', { class: 'setting-title', text: `TubeDesk ${current.version}` }),
+          h('div', { class: 'setting-desc muted', text: 'The version you are running.' })),
+        checkNow),
       h('h2', { text: 'Advanced' }),
       h('div', { class: 'setting' },
         h('div', { class: 'setting-text' }, h('div', { class: 'setting-title', text: 'yt-dlp command' }),
@@ -1076,6 +1125,11 @@ function applyAuth(a) {
   await listen('queue', (e) => applyQueue(e.payload));
   await listen('queue_index', (e) => applyQueueIndex(e.payload.index));
   await listen('auth', (e) => applyAuth(e.payload));
+  await listen('update', (e) => showUpdate(e.payload));
+  await listen('update_progress', (e) => {
+    const { downloaded, total } = e.payload;
+    setUpdateLabel(total ? `Updating… ${Math.floor((downloaded / total) * 100)}%` : 'Updating…');
+  });
   invoke('sync');
   try { setPins(await invoke('pins')); } catch (e) { /* none yet */ }
   preparePinned();

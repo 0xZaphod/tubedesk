@@ -71,6 +71,9 @@ img { display: block; }
 }
 .nav:hover { background: var(--hover); }
 .nav.active { background: var(--panel-2); font-weight: 600; }
+.nav.update-nav { color: var(--accent); font-weight: 600; }
+.nav.update-nav[hidden] { display: none; }
+.nav.update-nav[aria-busy="true"] { cursor: progress; opacity: .8; }
 .nav-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 14px 10px 4px; }
 .spacer { flex: 1; }
 /* Collapsed: a narrow rail with the toggle and the navigation icons. */

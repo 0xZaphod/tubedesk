@@ -1,6 +1,6 @@
 [package]
 name = "tubedesk"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Lightweight, audio-only YouTube Music desktop client built on Tauri"
 license = "GPL-3.0-or-later"

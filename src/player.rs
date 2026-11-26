@@ -152,6 +152,10 @@ impl Track {
         *seek = Some(to);
         // Silent from now on: what is buffered belongs to the old position.
         self.ready.store(false, Ordering::SeqCst);
+        // Not at the end any more (also stops a second end-of-stream report
+        // before the decoder gets to the seek).
+        self.finished.store(false, Ordering::SeqCst);
+        self.drained.store(false, Ordering::SeqCst);
         self.changed.notify_all();
     }
 
@@ -380,11 +384,16 @@ fn run(
     let mut levels = Levels { slider: volume, track: 1.0 };
     mixer.set_gain(levels.value());
     let output_failed = Arc::new(AtomicBool::new(false));
+    // No device yet (e.g. started at login before the sound server): keep
+    // retrying below instead of failing the app.
+    let mut retry_output_at: Option<Instant> = None;
     let mut _output = match open_output(&mixer, &output_failed) {
         Ok(o) => Some(o),
         Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
+            log::warn!("{e}; retrying");
+            output_failed.store(true, Ordering::SeqCst);
+            retry_output_at = Some(Instant::now() + Duration::from_secs(2));
+            None
         }
     };
     let _ = ready.send(Ok(()));
@@ -397,7 +406,6 @@ fn run(
     // While a seek is carried out, report its target (not 0 or the old spot).
     let mut seek_target: Option<f64> = None;
     let mut last_tick = (f64::NAN, f64::NAN, false, false);
-    let mut retry_output_at: Option<Instant> = None;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
@@ -454,11 +462,15 @@ fn run(
             output_failed.store(false, Ordering::SeqCst);
             match open_output(&mixer, &output_failed) {
                 Ok(o) => {
+                    if retry_output_at.is_some() {
+                        log::info!("audio output available again");
+                    }
                     _output = Some(o);
                     retry_output_at = None;
                 }
                 Err(e) => {
-                    log::warn!("{e}; retrying");
+                    // Warned when it first failed; retries every 2 s.
+                    log::debug!("{e}; retrying");
                     output_failed.store(true, Ordering::SeqCst);
                     retry_output_at = Some(Instant::now() + Duration::from_secs(2));
                 }
@@ -494,7 +506,10 @@ fn run(
         let duration = *t.duration.lock().unwrap();
         // Report the intent, so the Play/Pause button reflects the last click.
         let playing = want_playing;
-        let buffering = !ready && !t.finished.load(Ordering::SeqCst);
+        let finished = t.finished.load(Ordering::SeqCst);
+        // Waiting for data: starting, seeking, or the buffer ran dry mid-track
+        // (network stall); the position doesn't move meanwhile.
+        let buffering = !finished && (!ready || (want_playing && t.buf.lock().unwrap().is_empty()));
         let tick = (position, duration, playing, buffering);
         if tick != last_tick {
             last_tick = tick;
@@ -522,15 +537,16 @@ fn load(mixer: &Mixer, current: &mut Option<Arc<Track>>, uri: String, start: f64
     let t = Arc::new(Track::new(start));
     *mixer.current.lock().unwrap() = Some(t.clone());
     *current = Some(t.clone());
+    let decoder = t.clone();
     let spawned = std::thread::Builder::new().name("decoder".into()).spawn(move || {
-        if let Err(e) = decode(&t, &uri, start) {
-            if !t.cancelled.load(Ordering::SeqCst) {
-                t.fail(e);
+        if let Err(e) = decode(&decoder, &uri, start) {
+            if !decoder.cancelled.load(Ordering::SeqCst) {
+                decoder.fail(e);
             }
         }
     });
     if let Err(e) = spawned {
-        log::warn!("could not start decoder: {e}");
+        t.fail(format!("could not start the decoder: {e}"));
     }
 }
 
@@ -584,14 +600,21 @@ fn decode(t: &Track, uri: &str, start: f64) -> Result<(), String> {
         }
         let pending = t.seek.lock().unwrap().take();
         if let Some(to) = pending {
-            seek(&mut reader, track_id, to)?;
+            // Silent until audio from the new position is buffered (the
+            // seek may take a network round trip).
+            t.ready.store(false, Ordering::SeqCst);
+            let at_end = seek(&mut reader, track_id, to)?;
             opus.reset_state().map_err(|e| format!("opus: {e}"))?;
             t.buf.lock().unwrap().clear();
             *t.base.lock().unwrap() = to;
             t.played.store(0, Ordering::Relaxed);
-            t.finished.store(false, Ordering::SeqCst);
             t.drained.store(false, Ordering::SeqCst);
+            t.finished.store(false, Ordering::SeqCst);
             (skip_until, skip_frames) = (to, 0);
+            if at_end {
+                mark_finished(t);
+                continue;
+            }
         }
         if t.finished.load(Ordering::SeqCst) {
             // At the end: wait for a seek back, or for being replaced.
@@ -603,8 +626,7 @@ fn decode(t: &Track, uri: &str, start: f64) -> Result<(), String> {
         let packet = match reader.next_packet() {
             Ok(p) => p,
             Err(symphonia::core::errors::Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                t.finished.store(true, Ordering::SeqCst);
-                t.ready.store(true, Ordering::SeqCst); // so the output can drain (and report the end)
+                mark_finished(t);
                 continue;
             }
             Err(e) => return Err(format!("reading the stream failed: {e}")),
@@ -637,28 +659,50 @@ fn decode(t: &Track, uri: &str, start: f64) -> Result<(), String> {
         }
         let mut buf = t.buf.lock().unwrap();
         drop(seek);
+        // (Taking `seek` while holding `buf` is fine: nothing holds `seek`
+        // while waiting for `buf`.)
         while buf.len() + samples.len() > BUFFER_FRAMES * CHANNELS && !t.cancelled.load(Ordering::SeqCst) {
             buf = t.changed.wait_timeout(buf, Duration::from_millis(100)).unwrap().0;
-            if t.seek.try_lock().is_ok_and(|s| s.is_some()) {
+            if t.seek.lock().unwrap().is_some() {
                 break;
             }
         }
-        if t.seek.try_lock().is_ok_and(|s| s.is_some()) || t.cancelled.load(Ordering::SeqCst) {
+        // Push and mark ready only while no seek is pending, under its lock,
+        // so a seek requested meanwhile never hears these samples.
+        let seek = t.seek.lock().unwrap();
+        if seek.is_some() || t.cancelled.load(Ordering::SeqCst) {
             continue;
         }
         buf.extend(samples);
+        t.ready.store(true, Ordering::SeqCst);
+        drop(seek);
         drop(buf);
+    }
+}
+
+/// The stream is at its end: once the buffer is played, the track ends.
+/// `ready` lets the output drain it; not while a seek is pending.
+fn mark_finished(t: &Track) {
+    let seek = t.seek.lock().unwrap();
+    if seek.is_none() {
+        t.finished.store(true, Ordering::SeqCst);
         t.ready.store(true, Ordering::SeqCst);
     }
 }
 
 /// Seeks so decoding starts a little before `to` (see `SEEK_PREROLL`).
-fn seek(reader: &mut dyn FormatReader, track_id: u32, to: f64) -> Result<(), String> {
+/// Returns true if `to` is past the end (nothing left to play).
+fn seek(reader: &mut dyn FormatReader, track_id: u32, to: f64) -> Result<bool, String> {
+    use symphonia::core::errors::Error;
     let from = (to - SEEK_PREROLL).max(0.0);
     match reader.seek(SeekMode::Accurate, SeekTo::Time { time: Time::from(from), track_id: Some(track_id) }) {
-        Ok(_) => Ok(()),
-        // Past the end (or right at it): there is nothing left to play.
-        Err(symphonia::core::errors::Error::SeekError(_)) => Ok(()),
+        Ok(_) => Ok(false),
+        // The demuxer reports a position past the last frame as the end of
+        // the stream (and one before the first cue as out of range).
+        Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(true),
+        // Before the first index entry (rare: indexes start at 0): reading
+        // continues where it was.
+        Err(Error::SeekError(symphonia::core::errors::SeekErrorKind::OutOfRange)) => Ok(false),
         Err(e) => Err(format!("seeking failed: {e}")),
     }
 }

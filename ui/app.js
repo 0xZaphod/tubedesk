@@ -605,7 +605,7 @@ $('mute').addEventListener('click', () => {
 // plays and flattens when paused; the rest is a straight line.
 
 const seekCanvas = $('seek-canvas');
-const wave = { amp: 0, phase: 0, last: 0, raf: 0, tickAt: 0, colors: null };
+const wave = { amp: 0, phase: 0, last: 0, raf: 0, tickAt: 0, lastPos: null, colors: null };
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 function seekColors() {
   const cs = getComputedStyle(document.documentElement);
@@ -618,7 +618,9 @@ function seekPosition() {
   const max = Number(seek.max) || 0;
   if (state.seeking || state.seekHold || !state.now) return Number(seek.value);
   let p = state.now.position;
-  if (state.now.playing && !state.now.loading && !state.now.buffering) p += (performance.now() - wave.tickAt) / 1000;
+  // At most half a second ahead: reports come every 250 ms, so a longer gap
+  // means playback is stalling and the bar should wait too.
+  if (state.now.playing && !state.now.loading && !state.now.buffering) p += Math.min(0.5, (performance.now() - wave.tickAt) / 1000);
   return Math.min(p, max);
 }
 function waving() {
@@ -626,6 +628,8 @@ function waving() {
   return !!(n && n.track && n.playing && !n.loading && !n.buffering) && !document.hidden;
 }
 function drawSeek(t = performance.now()) {
+  // Called directly (dragging) or as a frame: never leave a second loop running.
+  if (wave.raf) cancelAnimationFrame(wave.raf);
   wave.raf = 0;
   const dpr = window.devicePixelRatio || 1;
   const w = Math.round(seekCanvas.clientWidth * dpr), h = Math.round(seekCanvas.clientHeight * dpr);
@@ -1019,7 +1023,8 @@ function applyState(now) {
   }
   $('dur').textContent = fmt(now.duration);
   if (document.activeElement !== vol) { vol.value = now.volume; showVolume(now.volume); }
-  wave.tickAt = performance.now();
+  // Restart the smoothing clock only when the player reported a new position.
+  if (now.position !== wave.lastPos) { wave.lastPos = now.position; wave.tickAt = performance.now(); }
   requestSeekDraw();
   if (now.error && now.error !== lastError) toast(`Playback failed: ${now.error}`, { error: true });
   lastError = now.error;

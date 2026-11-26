@@ -753,19 +753,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // `tubedesk --update`: install an available update without the UI, then restart.
     if args.iter().any(|a| a == "--update") {
-        let (h, core) = (handle.clone(), core.clone());
-        tauri::async_runtime::spawn(async move {
-            match update::install(&h, &core).await {
-                Ok(()) => {}
-                Err(e) => log::warn!("--update: {e}"),
-            }
-        });
-    } else {
-        let h = handle.clone();
-        update::spawn_checks(handle.clone(), move || {
-            h.try_state::<App>().is_some_and(|a| a.config.lock().unwrap().check_updates)
-        });
+        run_update(handle.clone());
     }
+    let h = handle.clone();
+    update::spawn_checks(handle.clone(), move || {
+        h.try_state::<App>().is_some_and(|a| a.config.lock().unwrap().check_updates)
+    });
 
     build_tray(&handle, core.clone())?;
     app.manage(App {
@@ -781,11 +774,34 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Installs an available update (`--update`), then restarts.
+fn run_update(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // The core may not be managed yet during setup; it is a moment later.
+        let core = loop {
+            match app.try_state::<App>() {
+                Some(a) => break a.core.clone(),
+                None => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        };
+        if let Err(e) = update::install(&app, &core).await {
+            log::warn!("--update: {e}");
+        }
+    });
+}
+
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("tubedesk=info")).init();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // `tubedesk --update` while TubeDesk runs: the running one updates.
+            if args.iter().any(|a| a == "--update") {
+                run_update(app.clone());
+            } else {
+                media::show_window(app);
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,

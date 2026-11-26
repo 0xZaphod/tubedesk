@@ -305,7 +305,8 @@ kbd {
 .seek input { flex: 1; }
 .time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 36px; text-align: center; }
 .extras { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
-.extras .np-actions { margin-right: 6px; }
+/* Centred in the space left of the volume slider. */
+.extras .np-actions { margin: 0 auto; }
 #volume { width: 110px; }
 input[type=range] { accent-color: var(--accent); }
 

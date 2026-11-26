@@ -85,6 +85,8 @@ const view = $('view');
 
 function navigate(route) {
   state.current = route;
+  // Every page shares one scroll area: start each at the top.
+  view.scrollTop = 0;
   if (!$('nowplaying').hidden) setNowPlaying(false);
   for (const b of document.querySelectorAll('.nav')) {
     b.classList.toggle('active', b.dataset.view === route.name);

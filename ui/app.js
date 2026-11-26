@@ -49,8 +49,13 @@ function toast(msg, { error = false } = {}) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { t.hidden = true; }, error ? 4000 : 2000);
 }
+function setQueueVisible(visible) {
+  $('queue').hidden = !visible;
+  $('queue-btn').setAttribute('aria-pressed', String(visible));
+  $('queue-btn').title = visible ? 'Hide queue' : 'Show queue';
+}
 function showQueue() {
-  $('queue').hidden = false;
+  setQueueVisible(true);
 }
 const PLAY_COMMANDS = new Set(['play', 'play_list']);
 
@@ -572,7 +577,7 @@ seek.addEventListener('change', () => {
 const vol = $('volume');
 vol.addEventListener('input', () => call('set_volume', { volume: Number(vol.value), persist: false }));
 vol.addEventListener('change', () => call('set_volume', { volume: Number(vol.value), persist: true }));
-$('queue-btn').addEventListener('click', () => { $('queue').hidden = !$('queue').hidden; });
+$('queue-btn').addEventListener('click', () => setQueueVisible($('queue').hidden));
 $('queue-clear').addEventListener('click', () => call('queue_clear'));
 // ---- shuffle / repeat ------------------------------------------------------------
 

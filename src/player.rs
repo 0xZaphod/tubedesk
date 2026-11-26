@@ -137,6 +137,7 @@ fn run(
                         PlayerCmd::LoadAt(uri, pos) => {
                             errored = false;
                             ended = false;
+                            flush_bus(&bus);
                             pending_start = Some(*pos);
                             seek_target = None;
                             last_pos = *pos;
@@ -159,6 +160,7 @@ fn run(
                         PlayerCmd::Load(_) | PlayerCmd::Stop => {
                             errored = false;
                             ended &= matches!(cmd, PlayerCmd::Stop);
+                            flush_bus(&bus);
                             pending_start = None;
                             seek_target = None;
                             last_pos = 0.0;
@@ -196,6 +198,7 @@ fn run(
                 MessageView::Error(_) if errored => {}
                 MessageView::Error(err) => {
                     errored = true;
+                    ended = true; // like Eos: the core moves on; no stale tick
                     want_playing = false;
                     let _ = playbin.set_state(gst::State::Ready);
                     let text = format!("{} ({:?})", err.error(), err.debug());
@@ -238,6 +241,13 @@ fn run(
         }
     }
     let _ = playbin.set_state(gst::State::Null);
+}
+
+/// Drops pending bus messages: an end of stream (or error) of the previous
+/// track still queued would otherwise end the track loaded now.
+fn flush_bus(bus: &gst::Bus) {
+    bus.set_flushing(true);
+    bus.set_flushing(false);
 }
 
 /// The volume is the slider's gain times the track's correction.

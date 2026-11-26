@@ -79,7 +79,8 @@ pub enum CoreMsg {
     SeekTo(f64),
     Volume(f64),
     Player(PlayerEvent),
-    Resolved { id: String, result: Result<Stream, String> },
+    /// `high_quality`: the quality the lookup was started with.
+    Resolved { id: String, result: Result<Stream, String>, high_quality: bool },
     /// A quick URL for the start of `id` (see `resolver::quick`).
     QuickResolved { id: String, url: String, size: u64, mime: String },
     /// The proxy found `id`'s stream URL expired (or refused): look it up again.
@@ -222,6 +223,8 @@ struct Core {
     quick_only: Option<String>,
     /// Seek here once the (resumed) track starts playing.
     pending_seek: Option<f64>,
+    /// The last seek target and when it was asked for (see `SeekBy`).
+    last_seek: Option<(f64, std::time::Instant)>,
     /// Position bucket of the last session save (saves every few seconds).
     saved_at: Option<u64>,
     consecutive_errors: u32,
@@ -274,6 +277,7 @@ pub fn spawn(
         restored: false,
         quick_only: None,
         pending_seek: None,
+        last_seek: None,
         saved_at: None,
         consecutive_errors: 0,
         radio_requested_for: None,
@@ -339,8 +343,10 @@ impl Core {
             }
             CoreMsg::PlayTracks { tracks, start, shuffle } => self.play_tracks(tracks, start, shuffle),
             CoreMsg::PlayList { tracks, start, shuffle, token } => {
+                // Kept in both modes: shuffle may be switched on before the
+                // later pages arrive, and only these may be shuffled with them.
+                let ids = tracks.iter().map(|t| t.id.clone()).collect();
                 self.play_tracks(tracks, start, Some(shuffle));
-                let ids = if self.shuffle { self.queue.iter().map(|t| t.id.clone()).collect() } else { HashSet::new() };
                 self.list = Some(ListInfo { token, shuffled: self.shuffle, ids });
             }
             CoreMsg::SetShuffle(on) => self.set_shuffle(on),
@@ -353,6 +359,7 @@ impl Core {
             }
             CoreMsg::Settings(s) => {
                 let quality_changed = s.high_quality != self.cfg.high_quality;
+                let normalize_on = s.normalize && !self.cfg.normalize;
                 self.cfg.high_quality = s.high_quality;
                 self.cfg.autoplay_radio = s.autoplay_radio;
                 self.cfg.normalize = s.normalize;
@@ -364,6 +371,16 @@ impl Core {
                     self.streams.retain(|id, _| Some(id) == current.as_ref());
                     if let Some(i) = self.index {
                         self.prefetch_ahead(i);
+                    }
+                }
+                if normalize_on {
+                    // Nothing was measured while it was off.
+                    if let Some(i) = self.index {
+                        let ids: Vec<String> =
+                            std::iter::once(i).chain(self.ahead(i)).filter_map(|k| self.queue.get(k)).map(|t| t.id.clone()).collect();
+                        for id in ids {
+                            self.want_loudness(&id);
+                        }
                     }
                 }
                 self.apply_gain();
@@ -479,7 +496,15 @@ impl Core {
                 self.emit_queue();
             }
             CoreMsg::Control(c) => self.control(c),
-            CoreMsg::SeekBy(d) => self.seek_to(self.now.position + d),
+            CoreMsg::SeekBy(d) => {
+                // Presses in quick succession add up: until the player reports
+                // the new position, count from the last target.
+                let from = match self.last_seek {
+                    Some((target, at)) if at.elapsed() < std::time::Duration::from_millis(1500) => target,
+                    _ => self.now.position,
+                };
+                self.seek_to(from + d);
+            }
             CoreMsg::SeekTo(t) => self.seek_to(t),
             CoreMsg::Refresh(id) => {
                 log::info!("{id}: stream URL expired or refused; looking it up again");
@@ -509,7 +534,7 @@ impl Core {
                     self.quick_only = Some(id);
                 }
             }
-            CoreMsg::Resolved { id, result } => {
+            CoreMsg::Resolved { id, result, high_quality } => {
                 let others_running = match self.inflight.get_mut(&id) {
                     Some(l) if l.running > 1 => {
                         l.running -= 1;
@@ -521,6 +546,15 @@ impl Core {
                     }
                 };
                 let wanted = self.awaiting.as_deref() == Some(id.as_str());
+                // Started before the quality setting changed: its stream is
+                // the other format, so look the track up again if needed.
+                if result.is_ok() && high_quality != self.cfg.high_quality {
+                    log::debug!("{id}: lookup was for the old quality; dropped");
+                    if !others_running && (wanted || self.quick_only.as_deref() == Some(id.as_str())) {
+                        self.request_now(&id);
+                    }
+                    return;
+                }
                 // Fill in a missing length for the shown track (e.g. a restored
                 // session or a home-feed track without duration).
                 if let Ok(stream) = &result {
@@ -628,7 +662,10 @@ impl Core {
     }
 
     fn seek_to(&mut self, t: f64) {
-        let t = t.max(0.0);
+        // Never past the end: that would end (or, resumed, skip) the track.
+        let end = if self.now.duration > 0.0 { (self.now.duration - 1.0).max(0.0) } else { f64::MAX };
+        let t = t.clamp(0.0, end);
+        self.last_seek = Some((t, std::time::Instant::now()));
         // Nothing loaded yet (restored, or the URL is still being looked up):
         // the idle player would ignore the seek, so start there instead.
         if self.restored || self.awaiting.is_some() {
@@ -740,7 +777,6 @@ impl Core {
                 }
                 if let Some(list) = &mut self.list {
                     list.shuffled = true; // its later pages get mixed in
-                    list.ids = self.queue.iter().map(|t| t.id.clone()).collect();
                 }
             } else {
                 if let Some(order) = self.order.take() {
@@ -791,6 +827,7 @@ impl Core {
         self.restored = false;
         self.quick_only = None;
         self.pending_seek = from;
+        self.last_seek = None;
         let Some(track) = self.queue.get(i).cloned() else { return };
         // Repeated play requests for a track that is still starting up (e.g. a
         // double-click) must not restart it.
@@ -1079,7 +1116,10 @@ impl Core {
         tauri::async_runtime::spawn(async move {
             // Results arrive one by one as yt-dlp finishes each video, so the
             // first of a batch isn't held back by the second.
-            resolver::resolve(&ytdlp, &ids, hq, lane, promotion, |id, result| me.send(CoreMsg::Resolved { id, result })).await;
+            resolver::resolve(&ytdlp, &ids, hq, lane, promotion, |id, result| {
+                me.send(CoreMsg::Resolved { id, result, high_quality: hq })
+            })
+            .await;
         });
     }
 

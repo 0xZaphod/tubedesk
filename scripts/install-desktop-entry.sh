@@ -12,14 +12,15 @@ data="${XDG_DATA_HOME:-$HOME/.local/share}"
 dir="$data/applications"
 mkdir -p "$dir"
 
-exec_path="$root/target/debug/tubedesk"
+# Exec= arguments are quoted, so paths with spaces work.
+exec_line="\"$root/target/debug/tubedesk\""
 icon="$root/icons/icon.png"
 if [ "${1:-}" = "--appimage" ]; then
   built=$(ls -t "$root"/target/release/bundle/appimage/*.AppImage 2>/dev/null | head -n1)
-  [ -n "$built" ] || { echo "no AppImage built; run: cargo tauri build --bundles appimage" >&2; exit 1; }
+  [ -n "$built" ] || { echo "no AppImage built; run: ./scripts/build-appimage.sh" >&2; exit 1; }
   mkdir -p "$HOME/.local/bin"
-  exec_path="$HOME/.local/bin/TubeDesk.AppImage"
-  install -m 755 "$built" "$exec_path"
+  target="$HOME/.local/bin/TubeDesk.AppImage"
+  install -m 755 "$built" "$target"
   # Copy the icon too, so the entry doesn't depend on this checkout.
   icon_dir="$data/icons/hicolor/512x512/apps"
   mkdir -p "$icon_dir"
@@ -27,7 +28,7 @@ if [ "${1:-}" = "--appimage" ]; then
   icon=dev.tubedesk.app
   # AppImageLauncher (if installed) intercepts every AppImage start and
   # spends seconds on it; this entry already integrates the app.
-  exec_path="env APPIMAGELAUNCHER_DISABLE=1 $exec_path"
+  exec_line="env APPIMAGELAUNCHER_DISABLE=1 \"$target\""
 fi
 
 write_entry() {
@@ -37,7 +38,7 @@ write_entry() {
 Type=Application
 Name=TubeDesk
 Comment=Audio-only YouTube Music client
-Exec=$exec_path
+Exec=$exec_line
 Icon=$icon
 Terminal=false
 Categories=AudioVideo;Audio;Player;
@@ -54,4 +55,4 @@ write_entry tubedesk "NoDisplay=true"
 if command -v update-desktop-database >/dev/null; then
   update-desktop-database "$dir" 2>/dev/null || true
 fi
-echo "installed $dir/dev.tubedesk.app.desktop -> $exec_path"
+echo "installed $dir/dev.tubedesk.app.desktop: Exec=$exec_line"

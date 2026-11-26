@@ -619,6 +619,9 @@ document.addEventListener('keydown', (e) => {
   // Typing in a text field: leave every key to it.
   const typing = t.isContentEditable || t.tagName === 'TEXTAREA' || (t.tagName === 'INPUT' && t.type !== 'range');
   if (typing || e.altKey || e.metaKey) return;
+  // A held key repeats only seeking and volume, never toggles (L would
+  // like/unlike on the account many times a second).
+  if (e.repeat && !e.key.startsWith('Arrow')) { if (e.code === 'Space') e.preventDefault(); return; }
   const ctrl = e.ctrlKey;
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const run = (fn) => { e.preventDefault(); fn(); };
@@ -632,7 +635,8 @@ document.addEventListener('keydown', (e) => {
   if (ctrl || e.shiftKey) return;
   if (key === 's') return run(() => $('shuffle').click());
   if (key === 'r') return run(() => $('repeat').click());
-  if (key === 'l') return run(() => { if (!document.querySelector('.np-actions').hidden) $('like').click(); });
+  // Only likes (unliking stays a click), matching the shortcut list.
+  if (key === 'l') return run(() => { if (!document.querySelector('.np-actions').hidden && rating.value !== 'like') $('like').click(); });
 });
 
 // ---- settings --------------------------------------------------------------------

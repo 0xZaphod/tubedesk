@@ -382,24 +382,31 @@ async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool)
 
 /// `shuffle`: from the Play (false) / Shuffle (true) buttons, switching the
 /// shuffle mode; omitted (a song clicked) keeps the mode.
+// The commands below save the config (file I/O), so they are `async`: sync
+// commands run on the main thread.
 #[tauri::command]
-fn play(app: State<'_, App>, tracks: Vec<TrackItem>, start: usize, shuffle: Option<bool>) {
+async fn play(app: State<'_, App>, tracks: Vec<TrackItem>, start: usize, shuffle: Option<bool>) -> Res<()> {
+    // An empty list is ignored by the core, so it doesn't change the mode either.
+    let shuffle = shuffle.filter(|_| !tracks.is_empty());
     app.core.send(CoreMsg::PlayTracks { tracks, start, shuffle });
     if let Some(on) = shuffle {
         update_config(&app, |c| c.shuffle = on);
     }
+    Ok(())
 }
 
 #[tauri::command]
-fn set_shuffle(app: State<'_, App>, on: bool) {
+async fn set_shuffle(app: State<'_, App>, on: bool) -> Res<()> {
     app.core.send(CoreMsg::SetShuffle(on));
     update_config(&app, |c| c.shuffle = on);
+    Ok(())
 }
 
 #[tauri::command]
-fn set_repeat(app: State<'_, App>, mode: Repeat) {
+async fn set_repeat(app: State<'_, App>, mode: Repeat) -> Res<()> {
     app.core.send(CoreMsg::SetRepeat(mode));
     update_config(&app, |c| c.repeat = mode);
+    Ok(())
 }
 
 fn update_config(app: &App, f: impl FnOnce(&mut Config)) {
@@ -434,7 +441,7 @@ fn settings(app: State<'_, App>) -> Settings {
 }
 
 #[tauri::command]
-fn set_settings(app: State<'_, App>, settings: Settings) -> Res<()> {
+async fn set_settings(app: State<'_, App>, settings: Settings) -> Res<()> {
     let ytdlp = settings.ytdlp.trim().to_string();
     if ytdlp.is_empty() {
         return Err("The yt-dlp command can't be empty".into());

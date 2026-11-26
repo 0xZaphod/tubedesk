@@ -965,8 +965,8 @@ impl Core {
     fn load_uri(&mut self, uri: String) {
         self.awaiting = None;
         self.apply_gain();
-        // Paused (while loading, or loaded paused): preroll paused via LoadAt,
-        // so not even the first moment is heard.
+        // Paused (while loading, or loaded paused): load via LoadAt, which
+        // produces no sound before the Play, not even the first moment.
         self.player.send(match (self.pending_seek.take(), self.now.playing) {
             (Some(pos), _) => PlayerCmd::LoadAt(uri, pos),
             (None, false) => PlayerCmd::LoadAt(uri, 0.0),

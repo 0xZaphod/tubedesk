@@ -28,7 +28,8 @@ pub fn show_window(app: &AppHandle) {
 
 /// Starts the media-controls thread and returns a sender for state updates.
 /// The core handle is delivered later (it needs this sender to be created first).
-pub fn spawn(app: AppHandle, core: std::sync::mpsc::Receiver<CoreHandle>) -> Option<Sender<MediaState>> {
+/// `hwnd`: the main window's handle (Windows only, where it is required).
+pub fn spawn(app: AppHandle, core: std::sync::mpsc::Receiver<CoreHandle>, hwnd: Option<usize>) -> Option<Sender<MediaState>> {
     let (tx, rx) = channel::<MediaState>();
     std::thread::Builder::new()
         .name("media-controls".into())
@@ -37,7 +38,7 @@ pub fn spawn(app: AppHandle, core: std::sync::mpsc::Receiver<CoreHandle>) -> Opt
             let config = PlatformConfig {
                 dbus_name: "tubedesk",
                 display_name: "TubeDesk",
-                hwnd: None, // TODO(windows): pass the main window HWND for SMTC
+                hwnd: hwnd.map(|h| h as *mut std::ffi::c_void),
             };
             let mut controls = match MediaControls::new(config) {
                 Ok(c) => c,

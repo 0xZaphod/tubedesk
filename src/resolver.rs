@@ -173,7 +173,7 @@ pub async fn resolve(
     };
     let urls: Vec<String> = ids.iter().map(|id| format!("https://music.youtube.com/watch?v={id}")).collect();
     let mut cmd = Command::new(ytdlp);
-    crate::appimage::host_env(&mut cmd);
+    crate::process::host_command(&mut cmd);
     let mut child = match cmd
         .args(["--quiet", "--no-warnings", "--no-playlist", "-f", format, "-j"])
         .args(&urls)

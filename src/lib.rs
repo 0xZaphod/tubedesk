@@ -6,6 +6,7 @@ mod core;
 mod home;
 mod media;
 mod player;
+mod process;
 mod proxy;
 mod resolver;
 
@@ -667,8 +668,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let proxy = tauri::async_runtime::block_on(proxy::StreamProxy::start())?;
 
+    let window = app.get_webview_window("main").expect("main window from tauri.conf.json");
+    // Windows' media controls (SMTC) attach to a window.
+    #[cfg(windows)]
+    let hwnd = window.hwnd().ok().map(|h| h.0 as usize);
+    #[cfg(not(windows))]
+    let hwnd = None;
     let (core_tx, core_rx) = std::sync::mpsc::channel();
-    let media_tx = if config.media_controls { media::spawn(handle.clone(), core_rx) } else { None };
+    let media_tx = if config.media_controls { media::spawn(handle.clone(), core_rx, hwnd) } else { None };
     let core = core::spawn(
         handle.clone(),
         rp.clone(),
@@ -687,7 +694,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let _ = core_tx.send(core.clone());
 
-    let window = app.get_webview_window("main").expect("main window from tauri.conf.json");
     // Read on every close, so the setting applies without a restart.
     let w = window.clone();
     window.on_window_event(move |e| {
@@ -727,7 +733,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run() {
-    appimage::fix_environment();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("tubedesk=info")).init();
 
     tauri::Builder::default()

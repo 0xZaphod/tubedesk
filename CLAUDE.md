@@ -16,10 +16,10 @@ cargo build
 cargo test                                   # a few unit tests (resolver); no linters set up
 RUST_LOG=tubedesk=debug cargo run            # normal dev run
 node --check ui/app.js                       # syntax-check the UI after edits
-./scripts/build-appimage.sh                  # release AppImage (~110 MB), curated GStreamer plugins
+./scripts/build-appimage.sh                  # release AppImage (Windows/macOS: GitHub Actions, build.yml)
 
 # Headless/silent test run: search, play the top results, no audio output
-TUBEDESK_AUDIO_SINK="fakesink sync=true" RUST_LOG=tubedesk=debug \
+TUBEDESK_AUDIO_SINK=null RUST_LOG=tubedesk=debug \
   timeout 60 ./target/debug/tubedesk --play "daft punk get lucky"
 ```
 
@@ -38,9 +38,11 @@ Testing caveats:
   org.mpris.MediaPlayer2.Player.{PlayPause,Next,Seek int64:…}`.
 - AppImage: its launcher points `LD_LIBRARY_PATH`, `PYTHONHOME` etc. into the
   image; child processes must go through `appimage::host_env` or the system
-  yt-dlp breaks ("<no Python frame>"). Its mount path changes every start, so
-  `appimage::fix_environment` gives GStreamer a stable symlink + own registry
-  (otherwise a full plugin rescan on every launch).
+  yt-dlp breaks ("<no Python frame>"). All helper programs are started via
+  `process::host_command` (also: no console window on Windows, Homebrew's
+  PATH on macOS).
+- libopus: system copy via pkg-config on Linux; built from source with CMake
+  elsewhere (`.cargo/config.toml` sets the CMake policy CMake 4 needs).
 - Player position is logged at trace level (`RUST_LOG=tubedesk::player=trace`).
 - Anything that writes to the user's YouTube account (likes, playlist edits)
   must not be exercised in tests; only the read endpoints.
@@ -54,11 +56,16 @@ Testing caveats:
   (`account.rs`: `like/*`, `browse/edit_playlist`,
   `playlist/get_add_to_playlist`).
 - Audio: yt-dlp resolves stream URLs → local HTTP proxy (`proxy.rs`) →
-  GStreamer `playbin` (`player.rs`, its own thread).
+  `player.rs`: HTTP range reader → symphonia's WebM demuxer → libopus →
+  cpal. A player thread takes commands and sends ticks; each track has a
+  decoder thread filling its buffer; the output callback drains the current
+  track's buffer. A replaced track is just cancelled and never read again.
 
 **Why the proxy exists (non-obvious YouTube behaviour, all measured):**
 - googlevideo answers 403 to requests without a byte range, so the proxy
-  fetches upstream in 1 MiB `&range=` chunks and honours GStreamer's `Range`.
+  fetches upstream in 1 MiB `&range=` chunks and honours the player's `Range`.
+  Every new request costs an upstream chunk, so the player keeps the file's
+  first 128 KiB (header, seek index) instead of re-reading it.
 - A freshly issued yt-dlp URL is refused (403) for ~3 s, purely time-based;
   `fetch` retries.
 - rustypipe's own stream URLs (iOS client, no PO token) are usable at once,
@@ -86,8 +93,8 @@ restore-on-start.
   a new one (`CoreMsg::Refresh`) when a URL expired or keeps being refused.
 - A list's later pages arrive as `Extend` tagged with the `PlayList` token;
   anything started in between invalidates it.
-- Resuming at a position uses `PlayerCmd::LoadAt`: preroll paused, seek, then
-  play, so the start isn't heard.
+- Resuming at a position uses `PlayerCmd::LoadAt`: the decoder seeks before
+  producing any audio, so the start isn't heard.
 - Shuffle is a mode: `Core::order` keeps the pre-shuffle ids (also in
   `session.json`) so turning it off restores the order (`unshuffled`, tested).
   The Play / Shuffle buttons set the mode; clicking a song keeps it.

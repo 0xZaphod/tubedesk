@@ -1,7 +1,7 @@
-//! Local HTTP proxy between GStreamer and googlevideo.com.
+//! Local HTTP proxy between the player and googlevideo.com.
 //!
 //! YouTube answers 403 to stream requests that don't ask for a byte range, and
-//! throttles large ones. GStreamer's first request has no range, so it talks to
+//! throttles large ones. The player talks to
 //! `http://127.0.0.1:<port>/s/<id>` instead, and this proxy fetches the
 //! upstream URL in ranged chunks (`&range=a-b`, like yt-dlp does). Seeking
 //! works because incoming `Range:` headers are honoured.
@@ -160,7 +160,7 @@ impl StreamProxy {
     }
 
     /// Registers the full (yt-dlp) URL of a stream and returns the local URL
-    /// for GStreamer. Re-registering the same URL keeps its warmed head; a
+    /// for the player. Re-registering the same URL keeps its warmed head; a
     /// quick URL registered earlier is kept if the file sizes match.
     pub fn register(&self, id: &str, s: &crate::resolver::Stream) -> String {
         let mut st = self.streams.lock().unwrap();
@@ -320,7 +320,7 @@ impl StreamProxy {
     }
 
     async fn serve(&self, mut sock: TcpStream) -> std::io::Result<()> {
-        // Read the request head (GStreamer sends small GET/HEAD requests).
+        // Read the request head (small GET/HEAD requests).
         let mut buf = Vec::with_capacity(2048);
         let mut tmp = [0u8; 1024];
         while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -462,7 +462,7 @@ impl StreamProxy {
                 }
                 return Ok(());
             };
-            // Socket errors (GStreamer seeked away or stopped) end the connection.
+            // Socket errors (the player seeked away or stopped) end the connection.
             if let Some(e) = pipe(&mut sock, resp, &mut pos).await? {
                 net_errors += 1;
                 if net_errors >= NET_ERRORS {

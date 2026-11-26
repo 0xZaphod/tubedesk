@@ -1,12 +1,37 @@
-//! Audio playback with GStreamer's `playbin`, on a dedicated thread.
+//! Audio playback in Rust, the same on every platform: the stream comes from
+//! the local proxy over HTTP (with byte ranges, for seeking), symphonia reads
+//! the WebM container, libopus decodes, cpal plays the result.
+//!
+//! Threads: the *player* thread takes commands and reports ticks; each loaded
+//! track has a *decoder* thread filling that track's sample buffer; the
+//! audio output (cpal's callback, or a timer for the silent test output)
+//! drains the current track's buffer. A track that is replaced is cancelled
+//! and simply never read again, so a decoder stuck on the network can't
+//! delay the next track.
 
-use gstreamer as gst;
-use gst::prelude::*;
+use std::collections::VecDeque;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
+
+use symphonia::core::codecs::CODEC_TYPE_OPUS;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
+use symphonia::core::io::{MediaSource, MediaSourceStream};
+use symphonia::core::units::Time;
 
 /// Loudest the app ever plays: 50% of full scale (−6 dB).
 const MAX_GAIN: f64 = 0.5;
+
+/// Opus always decodes at 48 kHz; we decode to stereo.
+const RATE: u32 = 48_000;
+const CHANNELS: usize = 2;
+/// Decoded audio kept ahead of the output (in frames): 2 s.
+const BUFFER_FRAMES: usize = 2 * RATE as usize;
+/// Decoding starts this far before a seek target: Opus needs some audio
+/// before the target to sound right at it.
+const SEEK_PREROLL: f64 = 0.08;
 
 /// Maps the 0–1 volume slider to an amplitude gain. A cubic curve matches how
 /// loudness is perceived (like PulseAudio/PipeWire sliders), so the low end of
@@ -17,7 +42,7 @@ fn gain(slider: f64) -> f64 {
 
 pub enum PlayerCmd {
     Load(String),
-    /// Load and start at a position: preroll paused, seek, then play.
+    /// Load and start at a position, without the start being heard.
     LoadAt(String, f64),
     Play,
     Pause,
@@ -28,7 +53,7 @@ pub enum PlayerCmd {
     Volume(f64),
     /// Per-track correction factor (volume normalization), 1.0 = none.
     TrackGain(f64),
-    /// Internal: a bus message arrived, handle it now (not at the next tick).
+    /// Internal: something happened (track ended), look now, not at the next tick.
     Wake,
 }
 
@@ -37,15 +62,15 @@ pub enum PlayerEvent {
     Eos,
     Error(String),
     /// `playing` is the intent (what Play/Pause last asked for); `buffering`
-    /// is true while a resume seek or a seek is still being carried out.
+    /// is true while a track starts or a seek is carried out.
     Tick { position: f64, duration: f64, playing: bool, buffering: bool },
 }
 
 #[derive(Clone)]
 pub struct Player {
-    /// Shared so the bus handler can hold a `Weak` to it: when every Player
-    /// is dropped the channel disconnects and the player thread ends.
-    tx: std::sync::Arc<Sender<PlayerCmd>>,
+    /// Shared so the output can hold a `Weak` to it: when every Player is
+    /// dropped the channel disconnects and the player thread ends.
+    tx: Arc<Sender<PlayerCmd>>,
 }
 
 impl Player {
@@ -53,18 +78,14 @@ impl Player {
         let _ = self.tx.send(cmd);
     }
 
-    pub fn spawn(
-        volume: f64,
-        on_event: impl Fn(PlayerEvent) + Send + 'static,
-    ) -> Result<Self, String> {
-        gst::init().map_err(|e| format!("GStreamer init failed: {e}"))?;
+    pub fn spawn(volume: f64, on_event: impl Fn(PlayerEvent) + Send + 'static) -> Result<Self, String> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
-        let tx = std::sync::Arc::new(tx);
+        let tx = Arc::new(tx);
         std::thread::Builder::new()
             .name("player".into())
             .spawn({
-                let wake = std::sync::Arc::downgrade(&tx);
+                let wake = Arc::downgrade(&tx);
                 move || run(rx, wake, volume, on_event, ready_tx)
             })
             .map_err(|e| e.to_string())?;
@@ -73,181 +94,415 @@ impl Player {
     }
 }
 
+// ---- shared state ------------------------------------------------------------
+
+/// One loaded track: written by its decoder thread, read by the output.
+struct Track {
+    /// Interleaved stereo samples at 48 kHz.
+    buf: Mutex<VecDeque<f32>>,
+    /// Signalled when the output took samples (room for the decoder) or the
+    /// track was cancelled / asked to seek.
+    changed: Condvar,
+    /// A seek the decoder hasn't carried out yet. Locked before `buf`.
+    seek: Mutex<Option<f64>>,
+    /// Position (s) of the first sample in `buf` after the last (re)start.
+    base: Mutex<f64>,
+    /// Frames played since `base`.
+    played: AtomicU64,
+    /// Samples since the last (re)start or seek are available.
+    ready: AtomicBool,
+    /// The decoder reached the end of the stream.
+    finished: AtomicBool,
+    /// Finished and everything played.
+    drained: AtomicBool,
+    cancelled: AtomicBool,
+    error: Mutex<Option<String>>,
+    /// Length in seconds (0 until known).
+    duration: Mutex<f64>,
+}
+
+impl Track {
+    fn new(start: f64) -> Self {
+        Self {
+            buf: Mutex::new(VecDeque::with_capacity(BUFFER_FRAMES * CHANNELS)),
+            changed: Condvar::new(),
+            seek: Mutex::new(None),
+            base: Mutex::new(start),
+            played: AtomicU64::new(0),
+            ready: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            drained: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            error: Mutex::new(None),
+            duration: Mutex::new(0.0),
+        }
+    }
+
+    fn position(&self) -> f64 {
+        *self.base.lock().unwrap() + self.played.load(Ordering::Relaxed) as f64 / f64::from(RATE)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.changed.notify_all();
+    }
+
+    fn request_seek(&self, to: f64) {
+        let mut seek = self.seek.lock().unwrap();
+        *seek = Some(to);
+        // Silent from now on: what is buffered belongs to the old position.
+        self.ready.store(false, Ordering::SeqCst);
+        self.changed.notify_all();
+    }
+
+    fn fail(&self, e: String) {
+        *self.error.lock().unwrap() = Some(e);
+    }
+}
+
+/// What the audio output plays from.
+struct Mixer {
+    current: Mutex<Option<Arc<Track>>>,
+    playing: AtomicBool,
+    /// Output gain (f32 bits).
+    gain: AtomicU32,
+    wake: Weak<Sender<PlayerCmd>>,
+}
+
+impl Mixer {
+    fn set_gain(&self, g: f64) {
+        self.gain.store((g as f32).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Fills `out` (interleaved, `channels` per frame, at `rate`) from the
+    /// current track. Silence while paused, loading or seeking.
+    fn render(&self, out: &mut [f32], channels: usize, resampler: &mut Resampler) {
+        out.fill(0.0);
+        let track = self.current.lock().unwrap().clone();
+        let Some(track) = track else { return };
+        if !self.playing.load(Ordering::Relaxed) || !track.ready.load(Ordering::SeqCst) {
+            return;
+        }
+        let gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let consumed = {
+            let mut buf = track.buf.lock().unwrap();
+            resampler.fill(&mut buf, out, channels, gain)
+        };
+        if consumed > 0 {
+            track.played.fetch_add(consumed as u64, Ordering::Relaxed);
+            track.changed.notify_all();
+        }
+        let empty = track.buf.lock().unwrap().is_empty();
+        if empty && track.finished.load(Ordering::SeqCst) && !track.drained.swap(true, Ordering::SeqCst) {
+            if let Some(tx) = self.wake.upgrade() {
+                let _ = tx.send(PlayerCmd::Wake);
+            }
+        }
+    }
+}
+
+/// Converts the 48 kHz stereo buffer to the output's rate and channel count.
+/// Linear interpolation: only used when the device can't run at 48 kHz.
+struct Resampler {
+    step: f64,
+    pos: f64,
+    prev: [f32; 2],
+    next: [f32; 2],
+}
+
+impl Resampler {
+    fn new(out_rate: u32) -> Self {
+        Self { step: f64::from(RATE) / f64::from(out_rate), pos: 1.0, prev: [0.0; 2], next: [0.0; 2] }
+    }
+
+    /// Returns the number of source frames taken from `buf`.
+    fn fill(&mut self, buf: &mut VecDeque<f32>, out: &mut [f32], channels: usize, gain: f32) -> usize {
+        let mut consumed = 0;
+        for frame in out.chunks_mut(channels) {
+            let (l, r) = if self.step == 1.0 {
+                match (buf.pop_front(), buf.pop_front()) {
+                    (Some(l), Some(r)) => {
+                        consumed += 1;
+                        (l, r)
+                    }
+                    _ => break, // ran dry: the rest stays silent
+                }
+            } else {
+                while self.pos >= 1.0 {
+                    match (buf.pop_front(), buf.pop_front()) {
+                        (Some(l), Some(r)) => {
+                            self.prev = self.next;
+                            self.next = [l, r];
+                            self.pos -= 1.0;
+                            consumed += 1;
+                        }
+                        _ => return consumed,
+                    }
+                }
+                let t = self.pos as f32;
+                self.pos += self.step;
+                (self.prev[0] + (self.next[0] - self.prev[0]) * t, self.prev[1] + (self.next[1] - self.prev[1]) * t)
+            };
+            let (l, r) = (l * gain, r * gain);
+            match channels {
+                1 => frame[0] = (l + r) * 0.5,
+                _ => {
+                    frame[0] = l;
+                    frame[1] = r;
+                }
+            }
+        }
+        consumed
+    }
+}
+
+// ---- output ------------------------------------------------------------------
+
+/// Keeps the audio output alive (it stops when dropped).
+enum Output {
+    #[allow(dead_code)] // only held: the stream plays while it exists
+    Device(cpal::Stream),
+    /// `TUBEDESK_AUDIO_SINK=null` (tests): consumes audio in real time, silently.
+    Null(Arc<AtomicBool>),
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        if let Output::Null(stop) = self {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn null_output_wanted() -> bool {
+    // "fakesink…" is what the GStreamer player understood; still accepted.
+    std::env::var("TUBEDESK_AUDIO_SINK").is_ok_and(|v| v == "null" || v.starts_with("fakesink"))
+}
+
+fn open_output(mixer: &Arc<Mixer>, failed: &Arc<AtomicBool>) -> Result<Output, String> {
+    if null_output_wanted() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (mixer, stop2) = (mixer.clone(), stop.clone());
+        std::thread::Builder::new()
+            .name("null-output".into())
+            .spawn(move || {
+                let mut resampler = Resampler::new(RATE);
+                let mut out = vec![0.0; (RATE as usize / 100) * CHANNELS];
+                let start = Instant::now();
+                let mut periods = 0u32;
+                while !stop2.load(Ordering::SeqCst) {
+                    mixer.render(&mut out, CHANNELS, &mut resampler);
+                    periods += 1;
+                    let due = start + Duration::from_millis(10) * periods;
+                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        return Ok(Output::Null(stop));
+    }
+
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or("no audio output device")?;
+    let default = device.default_output_config().map_err(|e| format!("audio output: {e}"))?;
+    // Prefer 48 kHz (no resampling), keeping the device's default channel
+    // count (devices also list mono configs) and sample format.
+    let config = device
+        .supported_output_configs()
+        .ok()
+        .and_then(|mut cs| {
+            cs.find(|c| {
+                c.sample_format() == default.sample_format()
+                    && c.channels() == default.channels()
+                    && c.min_sample_rate().0 <= RATE
+                    && c.max_sample_rate().0 >= RATE
+            })
+        })
+        .map(|c| c.with_sample_rate(cpal::SampleRate(RATE)))
+        .unwrap_or(default);
+    let format = config.sample_format();
+    let config: cpal::StreamConfig = config.into();
+    let channels = usize::from(config.channels);
+    log::debug!("audio output: {} Hz, {channels} channels, {format:?}", config.sample_rate.0);
+
+    let on_error = {
+        let failed = failed.clone();
+        move |e: cpal::StreamError| {
+            log::warn!("audio output error: {e}");
+            failed.store(true, Ordering::SeqCst);
+        }
+    };
+    let rate = config.sample_rate.0;
+    macro_rules! stream {
+        ($t:ty) => {{
+            let (mixer, mut resampler, mut scratch) = (mixer.clone(), Resampler::new(rate), Vec::<f32>::new());
+            device.build_output_stream(
+                &config,
+                move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
+                    scratch.resize(data.len(), 0.0);
+                    mixer.render(&mut scratch, channels, &mut resampler);
+                    for (d, s) in data.iter_mut().zip(&scratch) {
+                        *d = <$t as cpal::Sample>::from_sample(*s);
+                    }
+                },
+                on_error,
+                None,
+            )
+        }};
+    }
+    let stream = match format {
+        cpal::SampleFormat::F32 => stream!(f32),
+        cpal::SampleFormat::I16 => stream!(i16),
+        cpal::SampleFormat::U16 => stream!(u16),
+        cpal::SampleFormat::I32 => stream!(i32),
+        other => return Err(format!("unsupported audio output format {other:?}")),
+    }
+    .map_err(|e| format!("audio output: {e}"))?;
+    stream.play().map_err(|e| format!("audio output: {e}"))?;
+    Ok(Output::Device(stream))
+}
+
+// ---- player thread -------------------------------------------------------------
+
 fn run(
     rx: Receiver<PlayerCmd>,
-    wake: std::sync::Weak<Sender<PlayerCmd>>,
+    wake: Weak<Sender<PlayerCmd>>,
     volume: f64,
     on_event: impl Fn(PlayerEvent),
     ready: Sender<Result<(), String>>,
 ) {
-    let playbin = match gst::ElementFactory::make("playbin").build() {
-        Ok(p) => p,
+    let mixer = Arc::new(Mixer {
+        current: Mutex::new(None),
+        playing: AtomicBool::new(false),
+        gain: AtomicU32::new(0),
+        wake,
+    });
+    let mut levels = Levels { slider: volume, track: 1.0 };
+    mixer.set_gain(levels.value());
+    let output_failed = Arc::new(AtomicBool::new(false));
+    let mut _output = match open_output(&mixer, &output_failed) {
+        Ok(o) => Some(o),
         Err(e) => {
-            let _ = ready.send(Err(format!("playbin unavailable (install gst-plugins-base): {e}")));
+            let _ = ready.send(Err(e));
             return;
         }
     };
-    // Audio only: never build a video branch.
-    playbin.set_property_from_str("flags", "audio+soft-volume");
-    let mut levels = Levels { slider: volume, track: 1.0 };
-    levels.apply(&playbin);
-    // e.g. TUBEDESK_AUDIO_SINK="fakesink sync=true" for silent testing.
-    if let Ok(desc) = std::env::var("TUBEDESK_AUDIO_SINK") {
-        match gst::parse::bin_from_description(&desc, true) {
-            Ok(sink) => playbin.set_property("audio-sink", &sink),
-            Err(e) => log::warn!("invalid TUBEDESK_AUDIO_SINK: {e}"),
-        }
-    }
-    let bus = playbin.bus().expect("playbin has a bus");
-    // Wake the loop as soon as something it acts on is posted (end of track,
-    // error, preroll done), instead of up to 250 ms later.
-    // Only a weak handle, or it would keep the command channel open forever.
-    bus.set_sync_handler(move |_, msg| {
-        use gst::MessageView;
-        if matches!(msg.view(), MessageView::Eos(..) | MessageView::Error(..) | MessageView::AsyncDone(..)) {
-            if let Some(tx) = wake.upgrade() {
-                let _ = tx.send(PlayerCmd::Wake);
-            }
-        }
-        gst::BusSyncReply::Pass
-    });
     let _ = ready.send(Ok(()));
 
+    let mut track: Option<Arc<Track>> = None;
     let mut want_playing = false;
-    // GStreamer often posts several errors for one failure; report only the first per load.
-    let mut errored = false;
-    let mut last_tick = (f64::NAN, f64::NAN, false, false);
-    // While a seek is being carried out GStreamer reports no (or the old)
-    // position; report the seek target instead so the UI doesn't jump to 0.
-    let mut seek_target: Option<(f64, std::time::Instant)> = None;
-    let mut last_pos = 0.0;
-    // LoadAt: position to seek to once the pipeline has prerolled (paused).
-    let mut pending_start: Option<f64> = None;
-    // The track ended: no ticks until the next load. One more tick of the
-    // old track would reach the core after it started the next one, and
-    // look like that one is loaded but paused.
+    // Reported once per track; then no ticks until the next load (the core
+    // moves on, and a stale tick would describe the old track as the new one).
     let mut ended = false;
+    // While a seek is carried out, report its target (not 0 or the old spot).
+    let mut seek_target: Option<f64> = None;
+    let mut last_tick = (f64::NAN, f64::NAN, false, false);
+    let mut retry_output_at: Option<Instant> = None;
 
     loop {
-        // Commands (block briefly so the loop also acts as a ~4 Hz ticker).
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(cmd) => {
                 for cmd in std::iter::once(cmd).chain(rx.try_iter()) {
-                    match &cmd {
+                    match cmd {
+                        PlayerCmd::Load(uri) => {
+                            load(&mixer, &mut track, uri, 0.0);
+                            (ended, seek_target, want_playing) = (false, None, true);
+                        }
                         PlayerCmd::LoadAt(uri, pos) => {
-                            errored = false;
-                            ended = false;
-                            flush_bus(&bus);
-                            pending_start = Some(*pos);
-                            seek_target = None;
-                            last_pos = *pos;
-                            let _ = playbin.set_state(gst::State::Ready);
-                            playbin.set_property("uri", uri);
-                            want_playing = true;
-                            let _ = playbin.set_state(gst::State::Paused);
-                            continue;
+                            load(&mixer, &mut track, uri, pos);
+                            (ended, seek_target, want_playing) = (false, Some(pos), true);
                         }
-                        // Still prerolling for LoadAt: only decide whether to
-                        // play once the seek is done, never start early.
-                        PlayerCmd::Play | PlayerCmd::Pause | PlayerCmd::Toggle if pending_start.is_some() => {
-                            want_playing = match cmd {
-                                PlayerCmd::Play => true,
-                                PlayerCmd::Pause => false,
-                                _ => !want_playing,
-                            };
-                            continue;
+                        PlayerCmd::Play => want_playing = true,
+                        PlayerCmd::Pause => want_playing = false,
+                        PlayerCmd::Toggle => want_playing = !want_playing,
+                        PlayerCmd::Stop => {
+                            stop(&mixer, &mut track);
+                            (want_playing, seek_target) = (false, None);
                         }
-                        PlayerCmd::Load(_) | PlayerCmd::Stop => {
-                            errored = false;
-                            ended &= matches!(cmd, PlayerCmd::Stop);
-                            flush_bus(&bus);
-                            pending_start = None;
-                            seek_target = None;
-                            last_pos = 0.0;
+                        PlayerCmd::Seek(secs) => {
+                            if let Some(t) = &track {
+                                let secs = secs.max(0.0);
+                                t.request_seek(secs);
+                                seek_target = Some(secs);
+                                // Seeking back from the end: the track goes on.
+                                ended = false;
+                            }
                         }
-                        PlayerCmd::Seek(secs) => seek_target = Some((secs.max(0.0), std::time::Instant::now())),
-                        _ => {}
+                        PlayerCmd::Volume(v) => {
+                            levels.slider = v;
+                            mixer.set_gain(levels.value());
+                        }
+                        PlayerCmd::TrackGain(g) => {
+                            if (g - levels.track).abs() > 1e-6 {
+                                log::debug!("track gain {g:.3} ({:+.1} dB)", 20.0 * g.log10());
+                                levels.track = g;
+                                mixer.set_gain(levels.value());
+                            }
+                        }
+                        PlayerCmd::Wake => {}
                     }
-                    handle(&playbin, cmd, &mut want_playing, &mut levels);
                 }
+                mixer.playing.store(want_playing, Ordering::Relaxed);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        // Bus messages.
-        while let Some(msg) = bus.pop() {
-            use gst::MessageView;
-            match msg.view() {
-                MessageView::Eos(..) => {
-                    want_playing = false;
-                    ended = true;
-                    let _ = playbin.set_state(gst::State::Ready);
-                    on_event(PlayerEvent::Eos);
+        // The output device went away (unplugged, sound server restart): reopen it.
+        if output_failed.load(Ordering::SeqCst) && retry_output_at.is_none_or(|t| Instant::now() >= t) {
+            _output = None;
+            output_failed.store(false, Ordering::SeqCst);
+            match open_output(&mixer, &output_failed) {
+                Ok(o) => {
+                    _output = Some(o);
+                    retry_output_at = None;
                 }
-                MessageView::AsyncDone(..) if pending_start.is_some() => {
-                    // Prerolled: seek while still paused, then play.
-                    let pos = pending_start.take().unwrap();
-                    let t = gst::ClockTime::from_nseconds((pos * 1e9) as u64);
-                    let _ = playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, t);
-                    seek_target = Some((pos, std::time::Instant::now()));
-                    if want_playing {
-                        let _ = playbin.set_state(gst::State::Playing);
-                    }
+                Err(e) => {
+                    log::warn!("{e}; retrying");
+                    output_failed.store(true, Ordering::SeqCst);
+                    retry_output_at = Some(Instant::now() + Duration::from_secs(2));
                 }
-                MessageView::Error(_) if errored => {}
-                MessageView::Error(err) => {
-                    errored = true;
-                    ended = true; // like Eos: the core moves on; no stale tick
-                    want_playing = false;
-                    let _ = playbin.set_state(gst::State::Ready);
-                    let text = format!("{} ({:?})", err.error(), err.debug());
-                    log::warn!("playback error: {text}");
-                    on_event(PlayerEvent::Error(text));
-                }
-                _ => {}
             }
         }
 
+        let Some(t) = track.clone() else { continue };
         if ended {
             continue;
         }
-        // Position tick.
-        let mut position = playbin
-            .query_position::<gst::ClockTime>()
-            .map_or(last_pos, |t| t.nseconds() as f64 / 1e9);
-        if let Some(pos) = pending_start {
-            position = pos; // still prerolling for a LoadAt
-        } else if let Some((target, at)) = seek_target {
-            if (position - target).abs() < 1.5 || at.elapsed() > Duration::from_secs(3) {
-                seek_target = None; // seek done (or gave up waiting)
-            } else {
-                position = target;
-            }
+        if let Some(e) = t.error.lock().unwrap().take() {
+            log::warn!("playback error: {e}");
+            stop(&mixer, &mut track);
+            (ended, want_playing) = (true, false);
+            mixer.playing.store(false, Ordering::Relaxed);
+            on_event(PlayerEvent::Error(e));
+            continue;
         }
-        last_pos = position;
-        let duration = playbin
-            .query_duration::<gst::ClockTime>()
-            .map_or(0.0, |t| t.nseconds() as f64 / 1e9);
-        // Report the intent, so the Play/Pause button reflects the last click
-        // even while a resume seek is still in progress.
+        if t.drained.load(Ordering::SeqCst) {
+            (ended, want_playing) = (true, false);
+            mixer.playing.store(false, Ordering::Relaxed);
+            on_event(PlayerEvent::Eos);
+            continue;
+        }
+
+        let ready = t.ready.load(Ordering::SeqCst);
+        let mut position = t.position();
+        if ready {
+            seek_target = None;
+        } else if let Some(target) = seek_target {
+            position = target;
+        }
+        let duration = *t.duration.lock().unwrap();
+        // Report the intent, so the Play/Pause button reflects the last click.
         let playing = want_playing;
-        let buffering = pending_start.is_some() || seek_target.is_some();
+        let buffering = !ready && !t.finished.load(Ordering::SeqCst);
         let tick = (position, duration, playing, buffering);
-        if tick.0 != last_tick.0 || tick.1 != last_tick.1 || tick.2 != last_tick.2 || tick.3 != last_tick.3 {
+        if tick != last_tick {
             last_tick = tick;
             log::trace!("tick {position:.2}/{duration:.0} playing={playing} buffering={buffering}");
             on_event(PlayerEvent::Tick { position, duration, playing, buffering });
         }
     }
-    let _ = playbin.set_state(gst::State::Null);
-}
-
-/// Drops pending bus messages: an end of stream (or error) of the previous
-/// track still queued would otherwise end the track loaded now.
-fn flush_bus(bus: &gst::Bus) {
-    bus.set_flushing(true);
-    bus.set_flushing(false);
+    stop(&mixer, &mut track);
 }
 
 /// The volume is the slider's gain times the track's correction.
@@ -257,51 +512,274 @@ struct Levels {
 }
 
 impl Levels {
-    fn apply(&self, playbin: &gst::Element) {
-        playbin.set_property("volume", gain(self.slider) * self.track.clamp(0.0, 1.0));
+    fn value(&self) -> f64 {
+        gain(self.slider) * self.track.clamp(0.0, 1.0)
     }
 }
 
-fn handle(playbin: &gst::Element, cmd: PlayerCmd, want_playing: &mut bool, levels: &mut Levels) {
-    match cmd {
-        PlayerCmd::LoadAt(..) => {} // handled in the loop (needs the preroll state)
-        PlayerCmd::Load(uri) => {
-            let _ = playbin.set_state(gst::State::Ready);
-            playbin.set_property("uri", &uri);
-            *want_playing = true;
-            let _ = playbin.set_state(gst::State::Playing);
-        }
-        PlayerCmd::Play => {
-            *want_playing = true;
-            let _ = playbin.set_state(gst::State::Playing);
-        }
-        PlayerCmd::Pause => {
-            *want_playing = false;
-            let _ = playbin.set_state(gst::State::Paused);
-        }
-        PlayerCmd::Toggle => {
-            let next = if *want_playing { PlayerCmd::Pause } else { PlayerCmd::Play };
-            handle(playbin, next, want_playing, levels);
-        }
-        PlayerCmd::Stop => {
-            *want_playing = false;
-            let _ = playbin.set_state(gst::State::Ready);
-        }
-        PlayerCmd::Seek(secs) => {
-            let t = gst::ClockTime::from_nseconds((secs.max(0.0) * 1e9) as u64);
-            let _ = playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, t);
-        }
-        PlayerCmd::Volume(v) => {
-            levels.slider = v;
-            levels.apply(playbin);
-        }
-        PlayerCmd::TrackGain(g) => {
-            if (g - levels.track).abs() > 1e-6 {
-                log::debug!("track gain {g:.3} ({:+.1} dB)", 20.0 * g.log10());
-                levels.track = g;
-                levels.apply(playbin);
+fn load(mixer: &Mixer, current: &mut Option<Arc<Track>>, uri: String, start: f64) {
+    stop(mixer, current);
+    let t = Arc::new(Track::new(start));
+    *mixer.current.lock().unwrap() = Some(t.clone());
+    *current = Some(t.clone());
+    let spawned = std::thread::Builder::new().name("decoder".into()).spawn(move || {
+        if let Err(e) = decode(&t, &uri, start) {
+            if !t.cancelled.load(Ordering::SeqCst) {
+                t.fail(e);
             }
         }
-        PlayerCmd::Wake => {}
+    });
+    if let Err(e) = spawned {
+        log::warn!("could not start decoder: {e}");
+    }
+}
+
+fn stop(mixer: &Mixer, current: &mut Option<Arc<Track>>) {
+    if let Some(t) = current.take() {
+        t.cancel();
+    }
+    *mixer.current.lock().unwrap() = None;
+}
+
+// ---- decoder -------------------------------------------------------------------
+
+fn decode(t: &Track, uri: &str, start: f64) -> Result<(), String> {
+    let source = HttpSource::open(uri)?;
+    let stream = MediaSourceStream::new(Box::new(source), Default::default());
+    let mut reader = symphonia::default::formats::MkvReader::try_new(stream, &FormatOptions::default())
+        .map_err(|e| format!("not a playable stream: {e}"))?;
+    let (track_id, time_base, pre_skip) = {
+        let tr = reader
+            .tracks()
+            .iter()
+            .find(|tr| tr.codec_params.codec == CODEC_TYPE_OPUS)
+            .ok_or("no Opus audio in the stream")?;
+        let tb = tr.codec_params.time_base.ok_or("stream without time base")?;
+        if let Some(n) = tr.codec_params.n_frames {
+            let d = tb.calc_time(n);
+            *t.duration.lock().unwrap() = d.seconds as f64 + d.frac;
+        }
+        // OpusHead: samples to drop at the very start (encoder delay).
+        let pre_skip = tr.codec_params.extra_data.as_deref().filter(|h| h.len() >= 12).map_or(0, |h| u16::from_le_bytes([h[10], h[11]]));
+        (tr.id, tb, usize::from(pre_skip))
+    };
+    let mut opus = opus::Decoder::new(RATE, opus::Channels::Stereo).map_err(|e| format!("opus: {e}"))?;
+    let mut pcm = vec![0f32; 5760 * CHANNELS]; // 120 ms, the longest Opus frame
+    let secs = |ts: u64| {
+        let time = time_base.calc_time(ts);
+        time.seconds as f64 + time.frac
+    };
+
+    // Audio before `skip_until` (s) is decoded but not played; at the
+    // start the encoder delay is skipped instead.
+    let mut skip_until = 0.0;
+    let mut skip_frames = pre_skip;
+    if start > 0.0 {
+        *t.seek.lock().unwrap() = Some(start);
+    }
+
+    loop {
+        if t.cancelled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let pending = t.seek.lock().unwrap().take();
+        if let Some(to) = pending {
+            seek(&mut reader, track_id, to)?;
+            opus.reset_state().map_err(|e| format!("opus: {e}"))?;
+            t.buf.lock().unwrap().clear();
+            *t.base.lock().unwrap() = to;
+            t.played.store(0, Ordering::Relaxed);
+            t.finished.store(false, Ordering::SeqCst);
+            t.drained.store(false, Ordering::SeqCst);
+            (skip_until, skip_frames) = (to, 0);
+        }
+        if t.finished.load(Ordering::SeqCst) {
+            // At the end: wait for a seek back, or for being replaced.
+            let buf = t.buf.lock().unwrap();
+            let _ = t.changed.wait_timeout(buf, Duration::from_millis(200));
+            continue;
+        }
+
+        let packet = match reader.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                t.finished.store(true, Ordering::SeqCst);
+                t.ready.store(true, Ordering::SeqCst); // so the output can drain (and report the end)
+                continue;
+            }
+            Err(e) => return Err(format!("reading the stream failed: {e}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let frames = match opus.decode_float(&packet.data, &mut pcm, false) {
+            Ok(n) => n,
+            Err(e) => {
+                log::debug!("skipping an undecodable Opus packet: {e}");
+                continue;
+            }
+        };
+        let packet_start = secs(packet.ts);
+        let mut from = skip_frames.min(frames);
+        skip_frames -= from;
+        if skip_until > packet_start {
+            from = from.max((((skip_until - packet_start) * f64::from(RATE)) as usize).min(frames));
+        }
+        if from >= frames {
+            continue;
+        }
+        let samples = &pcm[from * CHANNELS..frames * CHANNELS];
+
+        // Wait for room; a seek or cancel makes these samples stale.
+        let seek = t.seek.lock().unwrap();
+        if seek.is_some() {
+            continue;
+        }
+        let mut buf = t.buf.lock().unwrap();
+        drop(seek);
+        while buf.len() + samples.len() > BUFFER_FRAMES * CHANNELS && !t.cancelled.load(Ordering::SeqCst) {
+            buf = t.changed.wait_timeout(buf, Duration::from_millis(100)).unwrap().0;
+            if t.seek.try_lock().is_ok_and(|s| s.is_some()) {
+                break;
+            }
+        }
+        if t.seek.try_lock().is_ok_and(|s| s.is_some()) || t.cancelled.load(Ordering::SeqCst) {
+            continue;
+        }
+        buf.extend(samples);
+        drop(buf);
+        t.ready.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Seeks so decoding starts a little before `to` (see `SEEK_PREROLL`).
+fn seek(reader: &mut dyn FormatReader, track_id: u32, to: f64) -> Result<(), String> {
+    let from = (to - SEEK_PREROLL).max(0.0);
+    match reader.seek(SeekMode::Accurate, SeekTo::Time { time: Time::from(from), track_id: Some(track_id) }) {
+        Ok(_) => Ok(()),
+        // Past the end (or right at it): there is nothing left to play.
+        Err(symphonia::core::errors::Error::SeekError(_)) => Ok(()),
+        Err(e) => Err(format!("seeking failed: {e}")),
+    }
+}
+
+// ---- HTTP source -----------------------------------------------------------------
+
+fn http() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            // The proxy may wait out YouTube's refusal window before answering.
+            .timeout(None)
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("HTTP client")
+    })
+}
+
+/// A seekable byte stream over HTTP range requests (to the local proxy).
+/// Reads go through one open response; a seek far away opens a new one.
+/// The start of the file is kept: reading the header jumps back and forth
+/// in it, and every new request makes the proxy fetch a chunk upstream.
+struct HttpSource {
+    url: String,
+    len: u64,
+    pos: u64,
+    head: Vec<u8>,
+    body: Option<(u64, reqwest::blocking::Response)>,
+}
+
+/// Bytes kept from the start of the file: header and seek index (Cues).
+const HEAD_LEN: u64 = 128 * 1024;
+
+/// Forward seeks up to this far read through the open response instead of
+/// starting a new request.
+const SKIP_LIMIT: u64 = 256 * 1024;
+
+impl HttpSource {
+    fn open(url: &str) -> Result<Self, String> {
+        let mut s = Self { url: url.to_string(), len: 0, pos: 0, head: Vec::new(), body: None };
+        let mut resp = s.request(0).map_err(|e| e.to_string())?;
+        let len = content_range_total(&resp)
+            .or_else(|| resp.content_length())
+            .ok_or("stream without a length")?;
+        let mut head = Vec::with_capacity(HEAD_LEN.min(len) as usize);
+        (&mut resp).take(HEAD_LEN.min(len)).read_to_end(&mut head).map_err(|e| format!("reading the stream failed: {e}"))?;
+        s.len = len;
+        s.body = Some((head.len() as u64, resp));
+        s.head = head;
+        Ok(s)
+    }
+
+    fn request(&self, from: u64) -> std::io::Result<reqwest::blocking::Response> {
+        let resp = http()
+            .get(&self.url)
+            .header(reqwest::header::RANGE, format!("bytes={from}-"))
+            .send()
+            .map_err(std::io::Error::other)?;
+        if !resp.status().is_success() {
+            return Err(std::io::Error::other(format!("stream request failed: HTTP {}", resp.status())));
+        }
+        Ok(resp)
+    }
+}
+
+fn content_range_total(resp: &reqwest::blocking::Response) -> Option<u64> {
+    let v = resp.headers().get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    v.rsplit('/').next()?.parse().ok()
+}
+
+impl Read for HttpSource {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.len || out.is_empty() {
+            return Ok(0);
+        }
+        if let Some(rest) = self.head.get(self.pos as usize..).filter(|r| !r.is_empty()) {
+            let n = rest.len().min(out.len());
+            out[..n].copy_from_slice(&rest[..n]);
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        // Reuse the open response if it is at (or a little before) `pos`.
+        if let Some((at, body)) = &mut self.body {
+            if *at < self.pos && self.pos - *at <= SKIP_LIMIT {
+                let skip = self.pos - *at;
+                std::io::copy(&mut body.take(skip), &mut std::io::sink())?;
+                *at += skip;
+            }
+        }
+        if !matches!(&self.body, Some((at, _)) if *at == self.pos) {
+            self.body = Some((self.pos, self.request(self.pos)?));
+        }
+        let (at, body) = self.body.as_mut().unwrap();
+        let n = body.read(out)?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream ended early"));
+        }
+        *at += n as u64;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for HttpSource {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos = pos.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek out of range"))?;
+        Ok(self.pos)
+    }
+}
+
+impl MediaSource for HttpSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
     }
 }

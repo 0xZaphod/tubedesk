@@ -13,8 +13,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
 rustypipe = { version = "0.11", features = ["userdata"] }
-gstreamer = "0.25"
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.12", features = ["stream", "blocking"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time", "process"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +21,9 @@ serde_json = "1"
 souvlaki = "0.8"
 log = "0.4"
 env_logger = "0.11"
+symphonia = { version = "0.5", default-features = false, features = ["mkv"] }
+opus = "0.3"
+cpal = "0.15"
 
 [profile.release]
 codegen-units = 1

@@ -810,7 +810,7 @@ function applyState(now) {
   const t = now.track;
   // Always show what Play/Pause will do; loading is a ring around the button,
   // so the button stays usable (and its state honest) while a track starts.
-  $('toggle').textContent = now.playing ? '⏸' : '▶';
+  $('toggle').classList.toggle('playing', !!now.playing);
   applyModes(now);
   $('toggle').classList.toggle('busy', !!(now.loading || now.buffering) && !!now.track);
   const hold = state.seekHold;

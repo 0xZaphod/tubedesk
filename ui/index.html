@@ -65,6 +65,34 @@
           <div id="np-title" class="ellipsis">Nothing playing</div>
           <div id="np-artist" class="ellipsis muted"></div>
         </div>
+      </div>
+      <div class="transport">
+        <div class="buttons">
+          <button id="shuffle" class="icon mode" title="Shuffle (S)" aria-label="Shuffle" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h3.5c2 0 3.2 1 4.3 2.6l2.4 4.8C14.3 16 15.5 17 17.5 17H21M3 17h3.5c1.6 0 2.7-.6 3.6-1.7M14.4 8.7c.9-1.1 2-1.7 3.1-1.7H21M18 4l3 3-3 3M18 14l3 3-3 3"/></svg>
+          </button>
+          <button id="prev" class="icon" title="Previous (Ctrl+←)" aria-label="Previous">
+            <svg class="glyph" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5.5v13a.6.6 0 0 1-.9.5L9 12.5a.6.6 0 0 1 0-1L18.1 5a.6.6 0 0 1 .9.5z"/></svg>
+          </button>
+          <button id="toggle" class="icon big" title="Play/Pause (Space)" aria-label="Play or pause">
+            <svg class="glyph play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.6v12.8a.8.8 0 0 0 1.2.7l10.2-6.4a.8.8 0 0 0 0-1.4L9.2 4.9A.8.8 0 0 0 8 5.6z"/></svg>
+            <svg class="glyph pause-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="5" width="4" height="14" rx="1"/><rect x="13.5" y="5" width="4" height="14" rx="1"/></svg>
+          </button>
+          <button id="next" class="icon" title="Next (Ctrl+→)" aria-label="Next">
+            <svg class="glyph" viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5.5v13a.6.6 0 0 0 .9.5l9.1-6.5a.6.6 0 0 0 0-1L5.9 5a.6.6 0 0 0-.9.5z"/></svg>
+          </button>
+          <button id="repeat" class="icon mode" title="Repeat (R)" aria-label="Repeat" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3l3 3-3 3M4 11V9.5A3.5 3.5 0 0 1 7.5 6H20M7 21l-3-3 3-3M20 13v1.5a3.5 3.5 0 0 1-3.5 3.5H4"/></svg>
+            <span class="badge" hidden>1</span>
+          </button>
+        </div>
+        <div class="seek">
+          <span id="pos" class="time">0:00</span>
+          <input id="seek" type="range" min="0" max="0" step="1" value="0" aria-label="Seek">
+          <span id="dur" class="time">0:00</span>
+        </div>
+      </div>
+      <div class="extras">
         <div class="np-actions" hidden>
           <button id="like" class="icon small" title="Like" aria-label="Like" aria-pressed="false">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11v9H4v-9zM7 11l4-8a2 2 0 0 1 2.5 2.2L13 9h5.5a2 2 0 0 1 2 2.4l-1.4 7A2 2 0 0 1 17.1 20H7"/></svg>
@@ -79,27 +107,6 @@
             <div id="playlist-menu" class="menu" role="menu" hidden></div>
           </div>
         </div>
-      </div>
-      <div class="transport">
-        <div class="buttons">
-          <button id="shuffle" class="icon mode" title="Shuffle (S)" aria-label="Shuffle" aria-pressed="false">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h3.5c2 0 3.2 1 4.3 2.6l2.4 4.8C14.3 16 15.5 17 17.5 17H21M3 17h3.5c1.6 0 2.7-.6 3.6-1.7M14.4 8.7c.9-1.1 2-1.7 3.1-1.7H21M18 4l3 3-3 3M18 14l3 3-3 3"/></svg>
-          </button>
-          <button id="prev" class="icon" title="Previous (Ctrl+←)" aria-label="Previous">⏮</button>
-          <button id="toggle" class="icon big" title="Play/Pause (Space)" aria-label="Play or pause">▶</button>
-          <button id="next" class="icon" title="Next (Ctrl+→)" aria-label="Next">⏭</button>
-          <button id="repeat" class="icon mode" title="Repeat (R)" aria-label="Repeat" aria-pressed="false">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3l3 3-3 3M4 11V9.5A3.5 3.5 0 0 1 7.5 6H20M7 21l-3-3 3-3M20 13v1.5a3.5 3.5 0 0 1-3.5 3.5H4"/></svg>
-            <span class="badge" hidden>1</span>
-          </button>
-        </div>
-        <div class="seek">
-          <span id="pos" class="time">0:00</span>
-          <input id="seek" type="range" min="0" max="0" step="1" value="0" aria-label="Seek">
-          <span id="dur" class="time">0:00</span>
-        </div>
-      </div>
-      <div class="extras">
         <input id="volume" type="range" min="0" max="1" step="0.01" aria-label="Volume">
         <button id="queue-btn" class="icon" title="Queue" aria-label="Toggle queue">☰</button>
       </div>

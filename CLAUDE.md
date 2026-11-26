@@ -31,6 +31,8 @@ Testing caveats:
   (session, pins, home cache, account cookie) with the user. `--play`
   overwrites their remembered session. Isolate tests with
   `XDG_DATA_HOME=… XDG_CONFIG_HOME=… XDG_CACHE_HOME=…` pointing at a temp dir.
+  The paths must be **absolute**: relative XDG paths are ignored and the run
+  silently uses the real dirs (e.g. `mktemp -d -p "$PWD"`, not `-p .`).
 - MPRIS can drive a running instance: `dbus-send --session --print-reply
   --dest=org.mpris.MediaPlayer2.tubedesk /org/mpris/MediaPlayer2
   org.mpris.MediaPlayer2.Player.{PlayPause,Next,Seek int64:…}`.

@@ -741,13 +741,14 @@ impl Core {
         let mut start = start.min(tracks.len() - 1);
         if self.shuffle {
             self.order = Some(tracks.iter().map(|t| t.id.clone()).collect());
-            // The Shuffle button: start with a random track, preferably one
-            // whose stream is prepared (instant start).
+            // The Shuffle button: `start` is a random pick made in advance
+            // (and prepared, so it usually starts instantly). Only the track
+            // playing now is avoided. Preferring *any* prepared track instead
+            // kept picking the few tracks the last shuffles had prepared.
             if shuffle == Some(true) {
                 let ids: Vec<&str> = tracks.iter().map(|t| t.id.as_str()).collect();
-                let ready = |id: &str| self.streams.get(id).is_some_and(|s| s.is_fresh());
                 let playing = self.now.track.as_ref().map(|t| t.id.as_str());
-                let k = shuffle_start(&ids, start, ready, playing);
+                let k = shuffle_start(&ids, start, playing);
                 if k != start {
                     log::debug!("shuffle: starting with {} instead of {}", ids[k], ids[start]);
                 }
@@ -1247,22 +1248,16 @@ impl Core {
     }
 }
 
-/// Where a shuffled list starts: the `suggested` track (picked at random in
-/// advance and prepared) if its stream is `ready`, else a random ready track,
-/// else a random track. The track `playing` now is avoided while there is
-/// another choice, so shuffling the same list again doesn't restart it.
-fn shuffle_start(ids: &[&str], suggested: usize, ready: impl Fn(&str) -> bool, playing: Option<&str>) -> usize {
-    let other = |k: usize| ids.len() < 2 || Some(ids[k]) != playing;
-    if other(suggested) && ready(ids[suggested]) {
+/// Where a shuffled list starts: the `suggested` (randomly pre-picked) track,
+/// unless it is the one `playing` now; then another random track, so
+/// shuffling the same list again doesn't restart the current song.
+fn shuffle_start(ids: &[&str], suggested: usize, playing: Option<&str>) -> usize {
+    if ids.len() < 2 || Some(ids[suggested]) != playing {
         return suggested;
     }
-    let random = |mut picks: Vec<usize>| {
-        crate::shuffle(&mut picks);
-        picks.first().copied()
-    };
-    random((0..ids.len()).filter(|&k| other(k) && ready(ids[k])).collect())
-        .or_else(|| if other(suggested) { Some(suggested) } else { random((0..ids.len()).filter(|&k| other(k)).collect()) })
-        .unwrap_or(suggested)
+    let mut others: Vec<usize> = (0..ids.len()).filter(|&k| Some(ids[k]) != playing).collect();
+    crate::shuffle(&mut others);
+    others.first().copied().unwrap_or(suggested)
 }
 
 /// The queue positions of `ids` in their pre-shuffle `order`: entry `n` of
@@ -1294,28 +1289,20 @@ mod tests {
     use super::{shuffle_start, unshuffled};
 
     #[test]
-    fn shuffle_starts_with_the_prepared_pick() {
+    fn shuffle_starts_with_the_random_pick() {
         let ids = ["a", "b", "c", "d"];
-        // The suggestion is ready: it starts.
-        assert_eq!(shuffle_start(&ids, 2, |id| id == "c" || id == "a", None), 2);
-        // Not ready: another ready track, never just the first in list order.
-        for _ in 0..50 {
-            let k = shuffle_start(&ids, 1, |id| id == "c" || id == "d", None);
-            assert!(k == 2 || k == 3, "{k}");
-        }
-        // Nothing ready: the suggestion.
-        assert_eq!(shuffle_start(&ids, 1, |_| false, None), 1);
+        assert_eq!(shuffle_start(&ids, 2, None), 2);
+        assert_eq!(shuffle_start(&ids, 2, Some("a")), 2);
     }
 
     #[test]
     fn shuffle_avoids_the_playing_track() {
         let ids = ["a", "b", "c"];
-        // "a" is playing and the only ready one: start elsewhere.
-        assert_ne!(shuffle_start(&ids, 0, |id| id == "a", Some("a")), 0);
-        // The suggestion is playing, "c" is ready.
-        assert_eq!(shuffle_start(&ids, 0, |id| id != "b", Some("a")), 2);
+        for _ in 0..20 {
+            assert_ne!(shuffle_start(&ids, 0, Some("a")), 0);
+        }
         // A one-track list may restart.
-        assert_eq!(shuffle_start(&["a"], 0, |_| true, Some("a")), 0);
+        assert_eq!(shuffle_start(&["a"], 0, Some("a")), 0);
     }
 
     fn order(ids: &[&str]) -> Vec<String> {

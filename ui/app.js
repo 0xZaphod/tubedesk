@@ -540,13 +540,6 @@ async function renderArtist(id) {
 }
 
 function renderAccount() {
-  const file = h('input', { type: 'file', accept: '.txt,text/plain', hidden: true, onchange: async () => {
-    const f = file.files[0];
-    if (!f) return;
-    const text = await f.text();
-    file.value = '';
-    await call('auth_import', { cookies: text });
-  } });
   if (state.loggedIn) {
     return [h('h1', { text: 'Account' }),
       h('p', { text: 'Signed in. Your YouTube Music library is available in the sidebar.' }),
@@ -555,10 +548,7 @@ function renderAccount() {
   return [h('h1', { text: 'Account' }),
     h('p', { text: 'Sign in to use your YouTube Music library (liked songs, playlists, albums, artists, history). Search and playback work without an account.' }),
     h('div', { class: 'row-actions' },
-      h('button', { class: 'btn', text: 'Sign in with Google', onclick: () => call('auth_login') }),
-      h('button', { class: 'btn secondary', text: 'Import cookies.txt…', onclick: () => file.click() }), file),
-    h('h2', { text: 'Signing in from your browser instead' }),
-    h('p', { class: 'muted', text: 'If Google refuses to sign in here: open a private/incognito window in your browser, sign in at music.youtube.com, export the cookies for youtube.com in Netscape cookies.txt format (e.g. with a "cookies.txt" extension), close that private window, then import the file above. Closing the window matters: YouTube rotates the session while it stays open.' }),
+      h('button', { class: 'btn', text: 'Sign in with Google', onclick: () => call('auth_login') })),
   ];
 }
 

@@ -30,9 +30,8 @@ cargo install tauri-cli --version "^2"
 
 ## Sign-in
 
-Use **Sign in** in the sidebar: either a private Google login window, or import
-a `cookies.txt` exported from a private browser window (close that window
-afterwards, YouTube rotates the session). The session is stored in
+Use **Sign in** in the sidebar, which opens a private Google login window. The
+session is stored in
 `~/.local/share/dev.tubedesk.app/` (mode `0700`); treat it like a password.
 
 ## Configuration

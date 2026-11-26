@@ -1,14 +1,10 @@
 //! YouTube account sign-in.
 //!
 //! rustypipe authenticates library requests with the account's YouTube
-//! cookies. Two ways to get them:
-//!
-//! 1. **Login window**: a private (incognito) webview where the user signs in
-//!    with Google. Once Google redirects back to youtube.com we copy the
-//!    cookies and destroy the window, so nothing else keeps using (and
-//!    rotating) that session.
-//! 2. **cookies.txt import** from a regular browser, for when Google refuses
-//!    to sign in inside an embedded webview.
+//! cookies. They come from a login window: a private (incognito) webview
+//! where the user signs in with Google. Once Google redirects back to
+//! youtube.com we copy the cookies and destroy the window, so nothing else
+//! keeps using (and rotating) that session.
 
 use rustypipe::client::RustyPipe;
 use serde::Serialize;
@@ -108,10 +104,6 @@ pub fn open_login_window(app: &AppHandle, rp: RustyPipe, user_agent: Option<Stri
     }
     builder.build()?;
     Ok(())
-}
-
-pub async fn import_cookies_txt(rp: &RustyPipe, text: &str) -> Result<(), String> {
-    rp.user_auth_set_cookie_txt(text).await.map_err(|e| e.to_string())
 }
 
 pub async fn logout(rp: &RustyPipe) {

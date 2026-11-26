@@ -524,13 +524,6 @@ fn auth_login(handle: AppHandle, app: State<'_, App>) -> Res<()> {
 }
 
 #[tauri::command]
-async fn auth_import(handle: AppHandle, app: State<'_, App>, cookies: String) -> Res<()> {
-    auth::import_cookies_txt(&app.rp, &cookies).await?;
-    auth::emit(&handle, true, None);
-    Ok(())
-}
-
-#[tauri::command]
 async fn auth_logout(handle: AppHandle, app: State<'_, App>) -> Res<()> {
     auth::logout(&app.rp).await;
     auth::emit(&handle, false, None);
@@ -651,7 +644,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,
             play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, track_rating, rate_track, playlist_options, add_to_playlist, remove_from_playlist, control, seek, set_volume, sync,
-            auth_status, auth_login, auth_import, auth_logout,
+            auth_status, auth_login, auth_logout,
         ])
         .setup(setup)
         .build(tauri::generate_context!())

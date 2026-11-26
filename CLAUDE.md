@@ -124,5 +124,7 @@ main thread, so keep them trivial; anything doing I/O is `async`.
   entry for every feature.
 - Config lives in `~/.config/dev.tubedesk.app/config.json` (`config.rs`,
   `#[serde(default)]`, so new keys need defaults).
-- The bundled icon is rendered from an icon theme's YouTube Music logo
-  (trademark): fine locally, not for publishing.
+- The icon is `icons/icon.svg` (original; never use YouTube's logo or red
+  play-button look). After changing it: render a 1024 px PNG with
+  `rsvg-convert`, run `cargo tauri icon` on it, copy the sizes listed in
+  `tauri.conf.json` into `icons/` and the 128 px one to `ui/icon.png`.

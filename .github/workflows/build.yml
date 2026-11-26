@@ -65,7 +65,16 @@ jobs:
           args: ${{ matrix.args }}
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('TubeDesk {0}', github.ref_name) || '' }}
-          releaseBody: See the README for requirements (yt-dlp and deno must be installed).
+          # Shown in the draft release; edit it there before publishing.
+          releaseBody: |
+            An unofficial, lightweight desktop client for YouTube Music.
+
+            **Requirements:** yt-dlp and deno must be installed (see the README).
+
+            **Windows and macOS builds are untested.** They are built automatically but
+            have not been tried on a real Windows or Mac machine yet. Please open an
+            issue if something doesn't work. The builds are unsigned: Windows SmartScreen
+            and macOS Gatekeeper will warn on first start (macOS: right-click the app → Open).
           releaseDraft: true
 
       - name: Keep the bundles (manual runs)

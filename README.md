@@ -4,6 +4,11 @@ A lightweight, audio-only YouTube Music desktop client built with Tauri 2 and
 Rust. It has its own UI and plays audio natively; it does not wrap the YouTube
 Music website.
 
+> **Disclaimer:** TubeDesk is an unofficial, independent project. It is not
+> affiliated with, endorsed by or sponsored by Google LLC or YouTube.
+> "YouTube" and "YouTube Music" are trademarks of Google LLC. Use it at your
+> own risk and in line with YouTube's terms of service.
+
 ## Requirements
 
 [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [deno](https://deno.com) (which
@@ -73,6 +78,5 @@ The earlier webview-wrapper version is tagged `wrapper-final`.
 
 ## License
 
-GPL-3.0-or-later (rustypipe is GPL-3.0). The bundled icon is rendered from an
-icon theme's YouTube Music logo (YouTube's trademark): replace it before
-publishing.
+GPL-3.0-or-later (rustypipe is GPL-3.0). The icon (`icons/icon.svg`) is
+original to this project.

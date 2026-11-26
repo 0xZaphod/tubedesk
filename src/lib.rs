@@ -9,7 +9,7 @@ mod player;
 mod proxy;
 mod resolver;
 
-use crate::core::{Control, CoreConfig, CoreHandle, CoreMsg};
+use crate::core::{Control, CoreConfig, CoreHandle, CoreMsg, CoreSettings, Repeat};
 use config::Config;
 use rustypipe::client::RustyPipe;
 use rustypipe::model::{Thumbnail, TrackItem};
@@ -358,9 +358,11 @@ async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool)
         }
         app.prepared.lock().unwrap().insert(key, next);
     }
-    let first = if shuffle { start.shuffled } else { start.tracks };
-    let (token, first_len) = (crate::core::list_token(), first.len());
-    app.core.send(CoreMsg::PlayList { tracks: first, shuffled: shuffle, token });
+    // Shuffled, the core starts with the track prepared for it (see `prepare_list`).
+    let first = if shuffle { start.tracks.iter().position(|t| t.id == start.shuffled[0].id).unwrap_or(0) } else { 0 };
+    let (token, first_len) = (crate::core::list_token(), start.tracks.len());
+    app.core.send(CoreMsg::PlayList { tracks: start.tracks, start: first, shuffle, token });
+    update_config(&app, |c| c.shuffle = shuffle);
 
     if let Some((mut pages, query)) = start.rest {
         let core = app.core.clone();
@@ -378,9 +380,80 @@ async fn play_list(app: State<'_, App>, kind: String, id: String, shuffle: bool)
     Ok(())
 }
 
+/// `shuffle`: from the Play (false) / Shuffle (true) buttons, switching the
+/// shuffle mode; omitted (a song clicked) keeps the mode.
 #[tauri::command]
-fn play(app: State<'_, App>, tracks: Vec<TrackItem>, start: usize) {
-    app.core.send(CoreMsg::PlayTracks { tracks, start });
+fn play(app: State<'_, App>, tracks: Vec<TrackItem>, start: usize, shuffle: Option<bool>) {
+    app.core.send(CoreMsg::PlayTracks { tracks, start, shuffle });
+    if let Some(on) = shuffle {
+        update_config(&app, |c| c.shuffle = on);
+    }
+}
+
+#[tauri::command]
+fn set_shuffle(app: State<'_, App>, on: bool) {
+    app.core.send(CoreMsg::SetShuffle(on));
+    update_config(&app, |c| c.shuffle = on);
+}
+
+#[tauri::command]
+fn set_repeat(app: State<'_, App>, mode: Repeat) {
+    app.core.send(CoreMsg::SetRepeat(mode));
+    update_config(&app, |c| c.repeat = mode);
+}
+
+fn update_config(app: &App, f: impl FnOnce(&mut Config)) {
+    let mut cfg = app.config.lock().unwrap();
+    f(&mut cfg);
+    cfg.save();
+}
+
+/// The settings shown on the Settings page.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Settings {
+    high_quality: bool,
+    normalize_volume: bool,
+    autoplay_radio: bool,
+    hide_on_close: bool,
+    /// Takes effect after a restart.
+    media_controls: bool,
+    ytdlp: String,
+}
+
+#[tauri::command]
+fn settings(app: State<'_, App>) -> Settings {
+    let c = app.config.lock().unwrap();
+    Settings {
+        high_quality: c.high_quality,
+        normalize_volume: c.normalize_volume,
+        autoplay_radio: c.autoplay_radio,
+        hide_on_close: c.hide_on_close,
+        media_controls: c.media_controls,
+        ytdlp: c.ytdlp.clone(),
+    }
+}
+
+#[tauri::command]
+fn set_settings(app: State<'_, App>, settings: Settings) -> Res<()> {
+    let ytdlp = settings.ytdlp.trim().to_string();
+    if ytdlp.is_empty() {
+        return Err("The yt-dlp command can't be empty".into());
+    }
+    update_config(&app, |c| {
+        c.high_quality = settings.high_quality;
+        c.normalize_volume = settings.normalize_volume;
+        c.autoplay_radio = settings.autoplay_radio;
+        c.hide_on_close = settings.hide_on_close;
+        c.media_controls = settings.media_controls;
+        c.ytdlp = ytdlp.clone();
+    });
+    app.core.send(CoreMsg::Settings(CoreSettings {
+        high_quality: settings.high_quality,
+        autoplay_radio: settings.autoplay_radio,
+        normalize: settings.normalize_volume,
+        ytdlp,
+    }));
+    Ok(())
 }
 
 #[tauri::command]
@@ -491,6 +564,12 @@ fn seek(app: State<'_, App>, position: f64) {
     app.core.send(CoreMsg::SeekTo(position));
 }
 
+/// Seeks relative to the current position (keyboard shortcuts).
+#[tauri::command]
+fn seek_by(app: State<'_, App>, seconds: f64) {
+    app.core.send(CoreMsg::SeekBy(seconds));
+}
+
 #[tauri::command]
 async fn set_volume(app: State<'_, App>, volume: f64, persist: bool) -> Res<()> {
     app.core.send(CoreMsg::Volume(volume));
@@ -592,6 +671,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             volume: config.volume,
             autoplay_radio: config.autoplay_radio,
             high_quality: config.high_quality,
+            normalize: config.normalize_volume,
+            shuffle: config.shuffle,
+            repeat: config.repeat,
             ytdlp: config.ytdlp.clone(),
             session_path: data_dir.join("session.json"),
         },
@@ -599,15 +681,17 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let _ = core_tx.send(core.clone());
 
     let window = app.get_webview_window("main").expect("main window from tauri.conf.json");
-    if config.hide_on_close {
-        let w = window.clone();
-        window.on_window_event(move |e| {
-            if let WindowEvent::CloseRequested { api, .. } = e {
+    // Read on every close, so the setting applies without a restart.
+    let w = window.clone();
+    window.on_window_event(move |e| {
+        if let WindowEvent::CloseRequested { api, .. } = e {
+            let hide = w.app_handle().try_state::<App>().is_some_and(|a| a.config.lock().unwrap().hide_on_close);
+            if hide {
                 api.prevent_close();
                 let _ = w.hide();
             }
-        });
-    }
+        }
+    });
 
     // `tubedesk --play "query"`: search and play the top results right away.
     let args: Vec<String> = std::env::args().collect();
@@ -615,7 +699,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let (rp, core) = (rp.clone(), core.clone());
         tauri::async_runtime::spawn(async move {
             match rp.query().music_search_tracks(&query).await {
-                Ok(r) => core.send(CoreMsg::PlayTracks { tracks: r.items.items, start: 0 }),
+                Ok(r) => core.send(CoreMsg::PlayTracks { tracks: r.items.items, start: 0, shuffle: None }),
                 Err(e) => log::warn!("--play search failed: {e}"),
             }
         });
@@ -643,7 +727,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| media::show_window(app)))
         .invoke_handler(tauri::generate_handler![
             home_cached, home_page, search, library, playlist, album, artist,
-            play, play_list, prepare_list, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, track_rating, rate_track, playlist_options, add_to_playlist, remove_from_playlist, control, seek, set_volume, sync,
+            play, play_list, prepare_list, set_shuffle, set_repeat, settings, set_settings, seek_by, enqueue, queue_jump, queue_remove, queue_move, queue_clear, prefetch, pins, pin, unpin, track_rating, rate_track, playlist_options, add_to_playlist, remove_from_playlist, control, seek, set_volume, sync,
             auth_status, auth_login, auth_logout,
         ])
         .setup(setup)

@@ -24,7 +24,10 @@ pub enum PlayerCmd {
     Toggle,
     Stop,
     Seek(f64),
+    /// The volume slider, 0–1.
     Volume(f64),
+    /// Per-track correction factor (volume normalization), 1.0 = none.
+    TrackGain(f64),
     /// Internal: a bus message arrived, handle it now (not at the next tick).
     Wake,
 }
@@ -86,7 +89,8 @@ fn run(
     };
     // Audio only: never build a video branch.
     playbin.set_property_from_str("flags", "audio+soft-volume");
-    playbin.set_property("volume", gain(volume));
+    let mut levels = Levels { slider: volume, track: 1.0 };
+    levels.apply(&playbin);
     // e.g. TUBEDESK_AUDIO_SINK="fakesink sync=true" for silent testing.
     if let Ok(desc) = std::env::var("TUBEDESK_AUDIO_SINK") {
         match gst::parse::bin_from_description(&desc, true) {
@@ -119,6 +123,10 @@ fn run(
     let mut last_pos = 0.0;
     // LoadAt: position to seek to once the pipeline has prerolled (paused).
     let mut pending_start: Option<f64> = None;
+    // The track ended: no ticks until the next load. One more tick of the
+    // old track would reach the core after it started the next one, and
+    // look like that one is loaded but paused.
+    let mut ended = false;
 
     loop {
         // Commands (block briefly so the loop also acts as a ~4 Hz ticker).
@@ -128,6 +136,7 @@ fn run(
                     match &cmd {
                         PlayerCmd::LoadAt(uri, pos) => {
                             errored = false;
+                            ended = false;
                             pending_start = Some(*pos);
                             seek_target = None;
                             last_pos = *pos;
@@ -149,6 +158,7 @@ fn run(
                         }
                         PlayerCmd::Load(_) | PlayerCmd::Stop => {
                             errored = false;
+                            ended &= matches!(cmd, PlayerCmd::Stop);
                             pending_start = None;
                             seek_target = None;
                             last_pos = 0.0;
@@ -156,7 +166,7 @@ fn run(
                         PlayerCmd::Seek(secs) => seek_target = Some((secs.max(0.0), std::time::Instant::now())),
                         _ => {}
                     }
-                    handle(&playbin, cmd, &mut want_playing);
+                    handle(&playbin, cmd, &mut want_playing, &mut levels);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -169,6 +179,7 @@ fn run(
             match msg.view() {
                 MessageView::Eos(..) => {
                     want_playing = false;
+                    ended = true;
                     let _ = playbin.set_state(gst::State::Ready);
                     on_event(PlayerEvent::Eos);
                 }
@@ -195,6 +206,9 @@ fn run(
             }
         }
 
+        if ended {
+            continue;
+        }
         // Position tick.
         let mut position = playbin
             .query_position::<gst::ClockTime>()
@@ -226,7 +240,19 @@ fn run(
     let _ = playbin.set_state(gst::State::Null);
 }
 
-fn handle(playbin: &gst::Element, cmd: PlayerCmd, want_playing: &mut bool) {
+/// The volume is the slider's gain times the track's correction.
+struct Levels {
+    slider: f64,
+    track: f64,
+}
+
+impl Levels {
+    fn apply(&self, playbin: &gst::Element) {
+        playbin.set_property("volume", gain(self.slider) * self.track.clamp(0.0, 1.0));
+    }
+}
+
+fn handle(playbin: &gst::Element, cmd: PlayerCmd, want_playing: &mut bool, levels: &mut Levels) {
     match cmd {
         PlayerCmd::LoadAt(..) => {} // handled in the loop (needs the preroll state)
         PlayerCmd::Load(uri) => {
@@ -245,7 +271,7 @@ fn handle(playbin: &gst::Element, cmd: PlayerCmd, want_playing: &mut bool) {
         }
         PlayerCmd::Toggle => {
             let next = if *want_playing { PlayerCmd::Pause } else { PlayerCmd::Play };
-            handle(playbin, next, want_playing);
+            handle(playbin, next, want_playing, levels);
         }
         PlayerCmd::Stop => {
             *want_playing = false;
@@ -255,7 +281,17 @@ fn handle(playbin: &gst::Element, cmd: PlayerCmd, want_playing: &mut bool) {
             let t = gst::ClockTime::from_nseconds((secs.max(0.0) * 1e9) as u64);
             let _ = playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, t);
         }
-        PlayerCmd::Volume(v) => playbin.set_property("volume", gain(v)),
+        PlayerCmd::Volume(v) => {
+            levels.slider = v;
+            levels.apply(playbin);
+        }
+        PlayerCmd::TrackGain(g) => {
+            if (g - levels.track).abs() > 1e-6 {
+                log::debug!("track gain {g:.3} ({:+.1} dB)", 20.0 * g.log10());
+                levels.track = g;
+                levels.apply(playbin);
+            }
+        }
         PlayerCmd::Wake => {}
     }
 }

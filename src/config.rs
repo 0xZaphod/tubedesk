@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// Best available audio (Opus ~160 kbps) instead of the smallest stream.
     pub high_quality: bool,
+    /// Turn loud tracks down to the same loudness (YouTube's loudness data).
+    pub normalize_volume: bool,
+    /// Queue modes, remembered.
+    pub shuffle: bool,
+    pub repeat: crate::core::Repeat,
     /// When the queue runs out, continue with YouTube Music's radio for the last track.
     pub autoplay_radio: bool,
     /// Volume slider position, 0.0–1.0 (remembered). Mapped to loudness on a
@@ -35,6 +40,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             high_quality: true,
+            normalize_volume: true,
+            shuffle: false,
+            repeat: crate::core::Repeat::Off,
             autoplay_radio: true,
             volume: 0.35,
             media_controls: true,

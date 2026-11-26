@@ -86,6 +86,14 @@ restore-on-start.
   anything started in between invalidates it.
 - Resuming at a position uses `PlayerCmd::LoadAt`: preroll paused, seek, then
   play, so the start isn't heard.
+- Shuffle is a mode: `Core::order` keeps the pre-shuffle ids (also in
+  `session.json`) so turning it off restores the order (`unshuffled`, tested).
+  The Play / Shuffle buttons set the mode; clicking a song keeps it.
+- Volume normalization: yt-dlp gives no loudness, rustypipe's player response
+  does (`loudness_db`, from the quick lookup or `want_loudness`). Loud tracks
+  are turned down only (`PlayerCmd::TrackGain`), like YouTube.
+- After end of stream the player sends no ticks until the next load: a stale
+  tick would mark the next (already prepared) track as loaded-but-paused.
 
 **Auth:** account cookies live in rustypipe's cache
 (`~/.local/share/dev.tubedesk.app/rustypipe_cache.json`, dir mode 0700).

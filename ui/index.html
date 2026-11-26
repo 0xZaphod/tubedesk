@@ -37,13 +37,14 @@
       <button class="nav" data-view="artists" title="Artists"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg><span class="label">Artists</span></button>
       <button class="nav" data-view="history" title="History"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg><span class="label">History</span></button>
       <div class="spacer"></div>
+      <button class="nav" data-view="settings" title="Settings"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg><span class="label">Settings</span></button>
       <button class="nav" data-view="account" id="account-nav" title="Account"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="10" r="3"/><path d="M6.5 18.5c1.2-2 3.2-3 5.5-3s4.3 1 5.5 3"/></svg><span class="label">Account</span></button>
     </nav>
 
     <main id="main">
       <header id="topbar">
         <form id="search-form">
-          <input id="search-input" type="search" placeholder="Search songs, albums, artists" autocomplete="off">
+          <input id="search-input" type="search" placeholder="Search songs, albums, artists  (Ctrl+F)" autocomplete="off">
         </form>
       </header>
       <section id="view"></section>
@@ -81,9 +82,16 @@
       </div>
       <div class="transport">
         <div class="buttons">
-          <button id="prev" class="icon" title="Previous" aria-label="Previous">⏮</button>
-          <button id="toggle" class="icon big" title="Play/Pause" aria-label="Play or pause">▶</button>
-          <button id="next" class="icon" title="Next" aria-label="Next">⏭</button>
+          <button id="shuffle" class="icon mode" title="Shuffle (S)" aria-label="Shuffle" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h3.5c2 0 3.2 1 4.3 2.6l2.4 4.8C14.3 16 15.5 17 17.5 17H21M3 17h3.5c1.6 0 2.7-.6 3.6-1.7M14.4 8.7c.9-1.1 2-1.7 3.1-1.7H21M18 4l3 3-3 3M18 14l3 3-3 3"/></svg>
+          </button>
+          <button id="prev" class="icon" title="Previous (Ctrl+←)" aria-label="Previous">⏮</button>
+          <button id="toggle" class="icon big" title="Play/Pause (Space)" aria-label="Play or pause">▶</button>
+          <button id="next" class="icon" title="Next (Ctrl+→)" aria-label="Next">⏭</button>
+          <button id="repeat" class="icon mode" title="Repeat (R)" aria-label="Repeat" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3l3 3-3 3M4 11V9.5A3.5 3.5 0 0 1 7.5 6H20M7 21l-3-3 3-3M20 13v1.5a3.5 3.5 0 0 1-3.5 3.5H4"/></svg>
+            <span class="badge" hidden>1</span>
+          </button>
         </div>
         <div class="seek">
           <span id="pos" class="time">0:00</span>

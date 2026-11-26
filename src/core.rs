@@ -26,14 +26,41 @@ pub enum Control {
     Stop,
 }
 
+/// What happens at the end of a track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Repeat {
+    #[default]
+    Off,
+    /// Start over at the queue's first track after its last.
+    All,
+    /// Play the current track again.
+    One,
+}
+
+/// Settings the core applies while running (see `config.rs`).
+pub struct CoreSettings {
+    pub high_quality: bool,
+    pub autoplay_radio: bool,
+    pub normalize: bool,
+    pub ytdlp: String,
+}
+
 pub enum CoreMsg {
-    PlayTracks { tracks: Vec<TrackItem>, start: usize },
-    /// A shuffled list: any track may come first, so one whose stream is
-    /// already prepared is moved to the front to start instantly.
-    PlayShuffled(Vec<TrackItem>),
-    /// The first page of a list (shuffled or not); its remaining pages follow
-    /// as `Extend` with the same `token` (see [`list_token`]).
-    PlayList { tracks: Vec<TrackItem>, shuffled: bool, token: u64 },
+    /// Plays `tracks` from `start`. `shuffle` switches the shuffle mode on or
+    /// off first (the Play / Shuffle buttons); `None` keeps the current mode.
+    /// With shuffle on, track `start` comes first and the rest is shuffled;
+    /// started from the Shuffle button (`Some(true)`), a track whose stream
+    /// is already prepared may come first instead, to start instantly.
+    PlayTracks { tracks: Vec<TrackItem>, start: usize, shuffle: Option<bool> },
+    /// The first page of a list (like `PlayTracks`); its remaining pages
+    /// follow as `Extend` with the same `token` (see [`list_token`]).
+    PlayList { tracks: Vec<TrackItem>, start: usize, shuffle: bool, token: u64 },
+    SetShuffle(bool),
+    SetRepeat(Repeat),
+    Settings(CoreSettings),
+    /// `id`'s loudness from YouTube (`None`: not available).
+    Loudness { id: String, db: Option<f32> },
     Enqueue(Vec<TrackItem>),
     PlayNext(Vec<TrackItem>),
     JumpTo(usize),
@@ -93,6 +120,9 @@ pub struct NowPlaying {
     pub duration: f64,
     pub volume: f64,
     pub error: Option<String>,
+    /// Copied from the core on every emit (`now` is reset per track).
+    pub shuffle: bool,
+    pub repeat: Repeat,
 }
 
 /// Sent to the UI as the `queue` event.
@@ -106,6 +136,10 @@ pub struct CoreConfig {
     pub volume: f64,
     pub autoplay_radio: bool,
     pub high_quality: bool,
+    /// Turn loud tracks down to YouTube's reference loudness.
+    pub normalize: bool,
+    pub shuffle: bool,
+    pub repeat: Repeat,
     pub ytdlp: String,
     /// Where the queue, current track and position are remembered.
     pub session_path: std::path::PathBuf,
@@ -121,6 +155,9 @@ struct Session {
     /// feed) carry no duration of their own.
     #[serde(default)]
     duration: f64,
+    /// The queue's order before shuffling (see `Core::order`).
+    #[serde(default)]
+    order: Option<Vec<String>>,
 }
 
 /// The list being played, while its later pages may still arrive.
@@ -152,6 +189,7 @@ struct SessionRef<'a> {
     index: Option<usize>,
     position: f64,
     duration: f64,
+    order: Option<&'a [String]>,
 }
 
 struct Core {
@@ -190,6 +228,15 @@ struct Core {
     radio_requested_for: Option<String>,
     /// Resolved stream URLs by video id (current + prefetched next track).
     streams: HashMap<String, Stream>,
+    shuffle: bool,
+    repeat: Repeat,
+    /// While shuffled: the track ids in the order they had before, so
+    /// turning shuffle off restores it. Tracks added since are kept after
+    /// the track they follow (see `unshuffle`).
+    order: Option<Vec<String>>,
+    /// YouTube's loudness per track id (dB above its reference level).
+    loudness: HashMap<String, Option<f32>>,
+    loudness_pending: HashSet<String>,
 }
 
 pub fn spawn(
@@ -206,6 +253,7 @@ pub fn spawn(
     let me3 = me.clone();
     proxy.on_refresh(move |id| me3.send(CoreMsg::Refresh(id.to_string())));
     let session_tx = spawn_session_writer(cfg.session_path.clone());
+    let (cfg_shuffle, cfg_repeat) = (cfg.shuffle, cfg.repeat);
     let core = Core {
         app,
         rp,
@@ -230,6 +278,11 @@ pub fn spawn(
         consecutive_errors: 0,
         radio_requested_for: None,
         streams: HashMap::new(),
+        shuffle: cfg_shuffle,
+        repeat: cfg_repeat,
+        order: None,
+        loudness: HashMap::new(),
+        loudness_pending: HashSet::new(),
     };
     let mut core = core;
     core.restore();
@@ -281,35 +334,56 @@ impl Core {
 
     fn handle(&mut self, msg: CoreMsg) {
         match msg {
-            CoreMsg::PlayTracks { tracks, .. } | CoreMsg::PlayShuffled(tracks) | CoreMsg::PlayList { tracks, .. }
-                if tracks.is_empty() =>
-            {
+            CoreMsg::PlayTracks { tracks, .. } | CoreMsg::PlayList { tracks, .. } if tracks.is_empty() => {
                 log::debug!("nothing to play; keeping the queue");
             }
-            CoreMsg::PlayTracks { tracks, start } => {
-                self.queue = tracks;
-                self.radio_requested_for = None;
-                self.list = None;
-                self.start_at(start.min(self.queue.len().saturating_sub(1)));
-                self.emit_queue();
+            CoreMsg::PlayTracks { tracks, start, shuffle } => self.play_tracks(tracks, start, shuffle),
+            CoreMsg::PlayList { tracks, start, shuffle, token } => {
+                self.play_tracks(tracks, start, Some(shuffle));
+                let ids = if self.shuffle { self.queue.iter().map(|t| t.id.clone()).collect() } else { HashSet::new() };
+                self.list = Some(ListInfo { token, shuffled: self.shuffle, ids });
             }
-            CoreMsg::PlayShuffled(mut tracks) => {
-                let first_ready = self.streams.get(&tracks[0].id).is_some_and(|s| s.is_fresh());
-                if !first_ready {
-                    if let Some(k) = tracks.iter().position(|t| self.streams.get(&t.id).is_some_and(|s| s.is_fresh())) {
-                        log::debug!("shuffle: starting with already prepared track {}", tracks[k].id);
-                        tracks.swap(0, k);
+            CoreMsg::SetShuffle(on) => self.set_shuffle(on),
+            CoreMsg::SetRepeat(mode) => {
+                self.repeat = mode;
+                if let Some(i) = self.index {
+                    self.prefetch_ahead(i); // the track after the last may now be the first
+                }
+                self.emit_state();
+            }
+            CoreMsg::Settings(s) => {
+                let quality_changed = s.high_quality != self.cfg.high_quality;
+                self.cfg.high_quality = s.high_quality;
+                self.cfg.autoplay_radio = s.autoplay_radio;
+                self.cfg.normalize = s.normalize;
+                self.cfg.ytdlp = s.ytdlp;
+                if quality_changed {
+                    // Prepared streams are in the old quality; keep only the
+                    // one playing (its quick start must match its full URL).
+                    let current = self.now.track.as_ref().map(|t| t.id.clone());
+                    self.streams.retain(|id, _| Some(id) == current.as_ref());
+                    if let Some(i) = self.index {
+                        self.prefetch_ahead(i);
                     }
                 }
-                self.handle(CoreMsg::PlayTracks { tracks, start: 0 });
+                self.apply_gain();
             }
-            CoreMsg::PlayList { tracks, shuffled, token } => {
-                let ids = if shuffled { tracks.iter().map(|t| t.id.clone()).collect() } else { HashSet::new() };
-                self.handle(if shuffled { CoreMsg::PlayShuffled(tracks) } else { CoreMsg::PlayTracks { tracks, start: 0 } });
-                self.list = Some(ListInfo { token, shuffled, ids });
+            CoreMsg::Loudness { id, db } => {
+                self.loudness_pending.remove(&id);
+                if self.loudness.len() > 1000 {
+                    self.loudness.clear();
+                }
+                log::debug!("{id}: loudness {db:?} dB");
+                self.loudness.insert(id.clone(), db);
+                if self.now.track.as_ref().is_some_and(|t| t.id == id) {
+                    self.apply_gain();
+                }
             }
             CoreMsg::Enqueue(tracks) => {
                 let was_empty = self.queue.is_empty();
+                if let Some(order) = &mut self.order {
+                    order.extend(tracks.iter().map(|t| t.id.clone()));
+                }
                 self.queue.extend(tracks);
                 if was_empty {
                     self.start_at(0);
@@ -374,6 +448,9 @@ impl Core {
                 // A list's rest arrives once, and only counts for that list.
                 if let Some(list) = self.list.take_if(|l| l.token == token) {
                     log::info!("adding {} more tracks of the list", tracks.len());
+                    if let Some(order) = &mut self.order {
+                        order.extend(tracks.iter().map(|t| t.id.clone()));
+                    }
                     if list.shuffled {
                         self.mix_in(&list.ids, tracks);
                     } else {
@@ -396,6 +473,7 @@ impl Core {
             }
             CoreMsg::Clear => {
                 self.queue.clear();
+                self.order = self.shuffle.then(Vec::new);
                 self.list = None;
                 self.stop();
                 self.emit_queue();
@@ -504,6 +582,9 @@ impl Core {
                 let new: Vec<_> = tracks.into_iter().filter(|t| t.id != for_id && !known.contains(&t.id)).collect();
                 if !new.is_empty() {
                     log::info!("radio: appended {} tracks", new.len());
+                    if let Some(order) = &mut self.order {
+                        order.extend(new.iter().map(|t| t.id.clone()));
+                    }
                     self.queue.extend(new);
                     self.emit_queue();
                     if let Some(i) = self.index {
@@ -583,10 +664,109 @@ impl Core {
     }
 
     fn advance(&mut self) {
-        match self.index {
-            Some(i) if i + 1 < self.queue.len() => self.start_at(i + 1),
-            _ => self.stop(),
+        match self.index.and_then(|i| self.next_index(i)) {
+            Some(k) => self.start_at(k),
+            None => self.stop(),
         }
+    }
+
+    /// The track after `i`: with repeat on, the first follows the last.
+    fn next_index(&self, i: usize) -> Option<usize> {
+        if i + 1 < self.queue.len() {
+            Some(i + 1)
+        } else if self.repeat != Repeat::Off && !self.queue.is_empty() {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    /// Up to two tracks that play after `i` (other than `i` itself).
+    fn ahead(&self, i: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut k = i;
+        while out.len() < 2 {
+            match self.next_index(k) {
+                Some(n) if n != i && !out.contains(&n) => {
+                    out.push(n);
+                    k = n;
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    fn play_tracks(&mut self, mut tracks: Vec<TrackItem>, start: usize, shuffle: Option<bool>) {
+        if let Some(on) = shuffle {
+            self.shuffle = on;
+        }
+        let mut start = start.min(tracks.len() - 1);
+        if self.shuffle {
+            self.order = Some(tracks.iter().map(|t| t.id.clone()).collect());
+            let ready = |t: &TrackItem| self.streams.get(&t.id).is_some_and(|s| s.is_fresh());
+            if shuffle == Some(true) && !ready(&tracks[start]) {
+                if let Some(k) = tracks.iter().position(ready) {
+                    log::debug!("shuffle: starting with already prepared track {}", tracks[k].id);
+                    start = k;
+                }
+            }
+            let first = tracks.remove(start);
+            crate::shuffle(&mut tracks);
+            tracks.insert(0, first);
+            start = 0;
+        } else {
+            self.order = None;
+        }
+        self.queue = tracks;
+        self.radio_requested_for = None;
+        self.list = None;
+        self.start_at(start);
+        self.emit_queue();
+    }
+
+    /// Shuffle on: the current track moves to the top, everything else is
+    /// shuffled after it. Off: the order from before comes back.
+    fn set_shuffle(&mut self, on: bool) {
+        if on != self.shuffle {
+            self.shuffle = on;
+            if on {
+                self.order = Some(self.queue.iter().map(|t| t.id.clone()).collect());
+                let first = self.index.map(|i| self.queue.remove(i));
+                crate::shuffle(&mut self.queue);
+                if let Some(t) = first {
+                    self.queue.insert(0, t);
+                    self.index = Some(0);
+                }
+                if let Some(list) = &mut self.list {
+                    list.shuffled = true; // its later pages get mixed in
+                    list.ids = self.queue.iter().map(|t| t.id.clone()).collect();
+                }
+            } else {
+                if let Some(order) = self.order.take() {
+                    self.unshuffle(&order);
+                }
+                if let Some(list) = &mut self.list {
+                    list.shuffled = false;
+                }
+            }
+            self.now.index = self.index;
+            self.emit_queue();
+            if let Some(i) = self.index {
+                self.prefetch_ahead(i);
+            }
+        }
+        self.emit_state();
+    }
+
+    /// Restores the order the queue had before shuffling. Tracks that weren't
+    /// in it (added with "Play next") stay right after the track they follow.
+    fn unshuffle(&mut self, order: &[String]) {
+        let ids: Vec<&str> = self.queue.iter().map(|t| t.id.as_str()).collect();
+        let perm = unshuffled(&ids, order);
+        let mut old: Vec<Option<TrackItem>> = std::mem::take(&mut self.queue).into_iter().map(Some).collect();
+        self.queue = perm.iter().filter_map(|&k| old[k].take()).collect();
+        self.index = self.index.and_then(|c| perm.iter().position(|&k| k == c));
     }
 
     fn stop(&mut self) {
@@ -617,6 +797,7 @@ impl Core {
         if self.index == Some(i) && self.now.loading && self.now.track.as_ref().map(|t| &t.id) == Some(&track.id) {
             return;
         }
+        log::debug!("starting track {i}: {}", track.id);
         self.awaiting = None;
         self.index = Some(i);
         self.player.send(PlayerCmd::Stop);
@@ -637,16 +818,31 @@ impl Core {
         // Play right away if the stream was prefetched, else wait for (possibly
         // already running) resolve.
         match self.streams.get(&track.id).filter(|s| s.is_fresh()).cloned() {
-            Some(stream) => self.load(&track.id, &stream),
+            Some(stream) => {
+                self.want_loudness(&track.id);
+                self.load(&track.id, &stream);
+            }
             None => {
                 self.awaiting = Some(track.id.clone());
                 self.request_now(&track.id);
-                // Start from a quick URL meanwhile; yt-dlp's full URL takes over.
+                // Start from a quick URL meanwhile; yt-dlp's full URL takes
+                // over. The same answer carries the track's loudness.
+                let loudness = !self.loudness.contains_key(&track.id) && self.loudness_pending.insert(track.id.clone());
                 let (rp, me, id, hq) = (self.rp.clone(), self.me.clone(), track.id.clone(), self.cfg.high_quality);
                 tauri::async_runtime::spawn(async move {
                     match resolver::quick(&rp, &id, hq).await {
-                        Ok((url, size, mime)) => me.send(CoreMsg::QuickResolved { id, url, size, mime }),
-                        Err(e) => log::debug!("{id}: no quick URL ({e})"),
+                        Ok(q) => {
+                            if loudness {
+                                me.send(CoreMsg::Loudness { id: id.clone(), db: q.loudness_db });
+                            }
+                            me.send(CoreMsg::QuickResolved { id, url: q.url, size: q.size, mime: q.mime });
+                        }
+                        Err(e) => {
+                            log::debug!("{id}: no quick URL ({e})");
+                            if loudness {
+                                me.send(CoreMsg::Loudness { id, db: None });
+                            }
+                        }
                     }
                 });
             }
@@ -654,7 +850,7 @@ impl Core {
         self.prefetch_ahead(i);
 
         // Near the end of the queue: extend it with YouTube Music's radio for this track.
-        if self.cfg.autoplay_radio && i + 2 >= self.queue.len() && self.radio_requested_for.as_deref() != Some(&track.id) {
+        if self.cfg.autoplay_radio && self.repeat == Repeat::Off && i + 2 >= self.queue.len() && self.radio_requested_for.as_deref() != Some(&track.id) {
             self.radio_requested_for = Some(track.id.clone());
             let (rp, me) = (self.rp.clone(), self.me.clone());
             tauri::async_runtime::spawn(async move {
@@ -682,8 +878,12 @@ impl Core {
     fn player_event(&mut self, ev: PlayerEvent) {
         match ev {
             PlayerEvent::Eos => {
+                log::debug!("end of track (repeat {:?})", self.repeat);
                 self.consecutive_errors = 0;
-                self.advance();
+                match self.index {
+                    Some(i) if self.repeat == Repeat::One => self.start_at(i),
+                    _ => self.advance(),
+                }
             }
             PlayerEvent::Error(e) => self.failed(e),
             PlayerEvent::Tick { position, duration, playing, buffering } => {
@@ -727,6 +927,7 @@ impl Core {
 
     fn load_uri(&mut self, uri: String) {
         self.awaiting = None;
+        self.apply_gain();
         // Paused (while loading, or loaded paused): preroll paused via LoadAt,
         // so not even the first moment is heard.
         self.player.send(match (self.pending_seek.take(), self.now.playing) {
@@ -739,6 +940,39 @@ impl Core {
         }
     }
 
+    /// The current track's volume correction: loud tracks are turned down to
+    /// YouTube's reference level, quiet ones are left alone (as YouTube does;
+    /// raising them could clip).
+    fn track_gain(&self) -> f64 {
+        let db = self.now.track.as_ref().and_then(|t| self.loudness.get(&t.id).copied().flatten());
+        match db {
+            Some(db) if self.cfg.normalize && db > 0.0 => 10f64.powf(-f64::from(db) / 20.0),
+            _ => 1.0,
+        }
+    }
+
+    fn apply_gain(&self) {
+        self.player.send(PlayerCmd::TrackGain(self.track_gain()));
+    }
+
+    /// Fetches `id`'s loudness (one quick API request), unless known.
+    fn want_loudness(&mut self, id: &str) {
+        if !self.cfg.normalize || self.loudness.contains_key(id) || !self.loudness_pending.insert(id.to_string()) {
+            return;
+        }
+        let (rp, me, id) = (self.rp.clone(), self.me.clone(), id.to_string());
+        tauri::async_runtime::spawn(async move {
+            let db = match rp.query().unauthenticated().player(&id).await {
+                Ok(p) => p.audio_streams.iter().find_map(|s| s.loudness_db),
+                Err(e) => {
+                    log::debug!("{id}: no loudness ({e})");
+                    None
+                }
+            };
+            me.send(CoreMsg::Loudness { id, db });
+        });
+    }
+
     fn cache_stream(&mut self, id: String, stream: Stream) {
         const MAX: usize = 40;
         self.streams.retain(|_, s| s.is_fresh());
@@ -746,7 +980,7 @@ impl Core {
         // (hover prefetches would otherwise push them out).
         let keep: Vec<String> = self
             .index
-            .map(|i| self.queue.iter().skip(i).take(3).map(|t| t.id.clone()).collect())
+            .map(|i| std::iter::once(i).chain(self.ahead(i)).filter_map(|k| self.queue.get(k)).map(|t| t.id.clone()).collect())
             .unwrap_or_default();
         while self.streams.len() >= MAX {
             let oldest = self
@@ -768,8 +1002,9 @@ impl Core {
     fn prefetch_ahead(&mut self, i: usize) {
         self.proxy.set_upcoming(self.upcoming());
         let mut missing = Vec::new();
-        for k in [i + 1, i + 2] {
+        for k in self.ahead(i) {
             let Some(id) = self.queue.get(k).map(|t| t.id.clone()) else { continue };
+            self.want_loudness(&id);
             match self.streams.get(&id).filter(|s| s.is_fresh()) {
                 // Already prepared: re-register so the proxy keeps its warmed
                 // start (its eviction is oldest-registered-first), and warm it
@@ -856,8 +1091,8 @@ impl Core {
 
     fn upcoming(&self) -> Vec<String> {
         let Some(i) = self.index else { return Vec::new() };
-        let first = if self.restored { i } else { i + 1 };
-        self.queue.iter().skip(first).take(i + 3 - first).map(|t| t.id.clone()).collect()
+        let current = self.restored.then_some(i);
+        current.into_iter().chain(self.ahead(i)).filter_map(|k| self.queue.get(k)).map(|t| t.id.clone()).collect()
     }
 
     fn warm(&self, id: &str) {
@@ -873,6 +1108,8 @@ impl Core {
     }
 
     fn emit_state(&mut self) {
+        self.now.shuffle = self.shuffle;
+        self.now.repeat = self.repeat;
         let _ = self.app.emit("state", &self.now);
         if let Some(tx) = &self.media {
             let t = self.now.track.as_ref();
@@ -913,6 +1150,7 @@ impl Core {
             index: self.index,
             position: self.now.position,
             duration: self.now.duration,
+            order: self.order.as_deref(),
         };
         match serde_json::to_vec(&s) {
             Ok(b) => {
@@ -936,6 +1174,9 @@ impl Core {
         self.queue = s.tracks;
         self.index = Some(i);
         self.restored = true;
+        if self.shuffle {
+            self.order = Some(s.order.unwrap_or_else(|| self.queue.iter().map(|t| t.id.clone()).collect()));
+        }
         let duration = if s.duration > 0.0 { s.duration } else { track.duration.unwrap_or(0) as f64 };
         self.now = NowPlaying {
             duration,
@@ -949,6 +1190,7 @@ impl Core {
         // Prepare the restored track and the next ones, so Play is instant.
         let id = self.queue[i].id.clone();
         self.request(&id);
+        self.want_loudness(&id);
         self.prefetch_ahead(i);
     }
 
@@ -957,5 +1199,65 @@ impl Core {
         self.restored = false;
         let (Some(i), pos) = (self.index, self.now.position) else { return };
         self.start_at_from(i, (pos > 1.0).then_some(pos), true);
+    }
+}
+
+/// The queue positions of `ids` in their pre-shuffle `order`: entry `n` of
+/// the result is the current position of the track that goes `n`th. Tracks
+/// not in `order` stay right after the track they currently follow; repeated
+/// ids take their ranks in turn.
+fn unshuffled(ids: &[&str], order: &[String]) -> Vec<usize> {
+    let mut ranks: HashMap<&str, std::collections::VecDeque<usize>> = HashMap::new();
+    for (k, id) in order.iter().enumerate() {
+        ranks.entry(id.as_str()).or_default().push_back(k);
+    }
+    // Ranked tracks sort by (rank + 1, 0); an unranked one by its
+    // predecessor's key with the second part counting up.
+    let mut anchor = (0, 0);
+    let mut keys = Vec::with_capacity(ids.len());
+    for (k, id) in ids.iter().enumerate() {
+        anchor = match ranks.get_mut(id).and_then(|r| r.pop_front()) {
+            Some(rank) => (rank + 1, 0),
+            None => (anchor.0, anchor.1 + 1),
+        };
+        keys.push((anchor, k));
+    }
+    keys.sort_by_key(|&(key, _)| key);
+    keys.into_iter().map(|(_, k)| k).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unshuffled;
+
+    fn order(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn apply<'a>(ids: &[&'a str], perm: &[usize]) -> Vec<&'a str> {
+        perm.iter().map(|&k| ids[k]).collect()
+    }
+
+    #[test]
+    fn restores_the_original_order() {
+        let ids = ["c", "a", "d", "b"];
+        assert_eq!(apply(&ids, &unshuffled(&ids, &order(&["a", "b", "c", "d"]))), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn added_tracks_stay_after_the_track_they_follow() {
+        // "x" was added with Play next while "c" played.
+        let ids = ["c", "x", "a", "d", "b"];
+        assert_eq!(apply(&ids, &unshuffled(&ids, &order(&["a", "b", "c", "d"]))), ["a", "b", "c", "x", "d"]);
+        // At the very top, they stay first.
+        let ids = ["x", "b", "a"];
+        assert_eq!(apply(&ids, &unshuffled(&ids, &order(&["a", "b"]))), ["x", "a", "b"]);
+    }
+
+    #[test]
+    fn removed_and_repeated_tracks() {
+        // "b" was removed since; "a" is in the list twice.
+        let ids = ["a", "c", "a"];
+        assert_eq!(unshuffled(&ids, &order(&["a", "b", "a", "c"])), [0, 2, 1]);
     }
 }

@@ -36,8 +36,9 @@ session is stored in
 
 ## Configuration
 
-`~/.config/dev.tubedesk.app/config.json`: `high_quality`, `autoplay_radio`,
-`volume`, `media_controls`, `hide_on_close`, `login_user_agent`, `ytdlp`.
+The Settings page (keyboard shortcuts are listed there too). Everything is stored
+in `~/.config/dev.tubedesk.app/config.json`; `login_user_agent` is only set
+there.
 
 ## How it works
 

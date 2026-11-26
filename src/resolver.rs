@@ -104,8 +104,8 @@ struct YtDlpFormat {
 /// ~2.5 s for yt-dlp plus ~3 s until its URL is accepted). Without a PO
 /// token YouTube only serves the first ~500 KB of it, but that is ~30 s of
 /// audio: plenty of time for the full URL to take over (see `proxy`).
-/// Returns (url, size, mime) of the same itag `resolve` asks yt-dlp for.
-pub async fn quick(rp: &rustypipe::client::RustyPipe, id: &str, high_quality: bool) -> Result<(String, u64, String), String> {
+/// Uses the same itag `resolve` asks yt-dlp for.
+pub async fn quick(rp: &rustypipe::client::RustyPipe, id: &str, high_quality: bool) -> Result<Quick, String> {
     let itag = if high_quality { 251 } else { 249 };
     let player = rp.query().unauthenticated().player(id).await.map_err(|e| e.to_string())?;
     let s = player
@@ -113,7 +113,15 @@ pub async fn quick(rp: &rustypipe::client::RustyPipe, id: &str, high_quality: bo
         .iter()
         .find(|s| s.itag == itag && s.drm_track_type.is_none())
         .ok_or_else(|| format!("no itag {itag} stream"))?;
-    Ok((s.url.clone(), s.size, s.mime.clone()))
+    Ok(Quick { url: s.url.clone(), size: s.size, mime: s.mime.clone(), loudness_db: s.loudness_db })
+}
+
+pub struct Quick {
+    pub url: String,
+    pub size: u64,
+    pub mime: String,
+    /// See `rustypipe::model::AudioStream::loudness_db`.
+    pub loudness_db: Option<f32>,
 }
 
 /// Looks up `ids` in one yt-dlp run (saving a Python start and a JS

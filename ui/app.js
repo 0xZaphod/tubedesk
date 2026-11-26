@@ -140,6 +140,7 @@ async function render(route) {
     case 'album': return show(...(await renderAlbum(route.id)));
     case 'artist': return show(...(await renderArtist(route.id)));
     case 'account': return show(...renderAccount());
+    case 'settings': return show(...(await renderSettings()));
     }
   } catch (e) {
     show(h('div', { class: 'empty', text: `Could not load: ${e}` }));
@@ -325,10 +326,12 @@ function playButtons(tracks) {
   invoke('prefetch', { id: tracks[0].id, priority: true });
   invoke('prefetch', { id: order[0].id, priority: false });
   return h('div', { class: 'row-actions' },
-    h('button', { class: 'btn', text: 'Play', onclick: () => call('play', { tracks, start: 0 }) }),
+    h('button', { class: 'btn', text: 'Play', onclick: () => call('play', { tracks, start: 0, shuffle: false }) }),
     h('button', { class: 'btn secondary', text: 'Shuffle', onclick: () => {
-      // `tracks` may have lost songs since (removed from your playlist).
-      call('play', { tracks: order.filter((t) => tracks.includes(t)), start: 0 });
+      // Start with the prepared pick (if it is still in the list: songs may
+      // have been removed from your playlist since); the core shuffles the rest.
+      const first = Math.max(0, tracks.indexOf(order[0]));
+      call('play', { tracks, start: first, shuffle: true });
       order = shuffledCopy(tracks); // next Shuffle gets a new order, prepared too
       invoke('prefetch', { id: order[0].id, priority: false });
     } }),
@@ -571,11 +574,111 @@ vol.addEventListener('input', () => call('set_volume', { volume: Number(vol.valu
 vol.addEventListener('change', () => call('set_volume', { volume: Number(vol.value), persist: true }));
 $('queue-btn').addEventListener('click', () => { $('queue').hidden = !$('queue').hidden; });
 $('queue-clear').addEventListener('click', () => call('queue_clear'));
+// ---- shuffle / repeat ------------------------------------------------------------
+
+const REPEAT_NEXT = { off: 'all', all: 'one', one: 'off' };
+const REPEAT_TITLE = { off: 'Repeat: off', all: 'Repeat: all', one: 'Repeat: this song' };
+$('shuffle').addEventListener('click', () => call('set_shuffle', { on: !(state.now && state.now.shuffle) }));
+$('repeat').addEventListener('click', () => call('set_repeat', { mode: REPEAT_NEXT[(state.now && state.now.repeat) || 'off'] }));
+function applyModes(now) {
+  $('shuffle').setAttribute('aria-pressed', String(!!now.shuffle));
+  $('shuffle').title = now.shuffle ? 'Shuffle: on (S)' : 'Shuffle: off (S)';
+  const repeat = now.repeat || 'off';
+  $('repeat').setAttribute('aria-pressed', String(repeat !== 'off'));
+  $('repeat').title = `${REPEAT_TITLE[repeat]} (R)`;
+  $('repeat').querySelector('.badge').hidden = repeat !== 'one';
+}
+
+// ---- keyboard shortcuts ------------------------------------------------------------
+
+const SHORTCUTS = [
+  [['Space'], 'Play / pause'],
+  [['←', '→'], 'Seek 5 seconds back / forward'],
+  [['Ctrl', '←'], 'Previous song'],
+  [['Ctrl', '→'], 'Next song'],
+  [['Ctrl', '↑'], 'Volume up'],
+  [['Ctrl', '↓'], 'Volume down'],
+  [['S'], 'Shuffle on / off'],
+  [['R'], 'Repeat: off → all → this song'],
+  [['L'], 'Like the current song'],
+  [['Ctrl', 'F'], 'Search (also /)'],
+  [['Ctrl', ','], 'Settings'],
+];
+function nudgeVolume(delta) {
+  const v = Math.min(1, Math.max(0, Number(vol.value) + delta));
+  vol.value = v;
+  call('set_volume', { volume: v, persist: true });
+}
 document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT') return;
-  if (e.code === 'Space') { e.preventDefault(); call('control', { action: 'toggle' }); }
-  if (e.key === '/' ) { e.preventDefault(); $('search-input').focus(); }
+  const t = e.target;
+  // Typing in a text field: leave every key to it.
+  const typing = t.isContentEditable || t.tagName === 'TEXTAREA' || (t.tagName === 'INPUT' && t.type !== 'range');
+  if (typing || e.altKey || e.metaKey) return;
+  const ctrl = e.ctrlKey;
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  const run = (fn) => { e.preventDefault(); fn(); };
+  if (!ctrl && e.code === 'Space') return run(() => call('control', { action: 'toggle' }));
+  if ((ctrl && key === 'f') || (!ctrl && key === '/')) return run(() => { $('search-input').focus(); $('search-input').select(); });
+  if (ctrl && key === ',') return run(() => navigate({ name: 'settings' }));
+  if (key === 'ArrowLeft') return run(() => (ctrl ? call('control', { action: 'previous' }) : call('seek_by', { seconds: -5 })));
+  if (key === 'ArrowRight') return run(() => (ctrl ? call('control', { action: 'next' }) : call('seek_by', { seconds: 5 })));
+  if (ctrl && key === 'ArrowUp') return run(() => nudgeVolume(0.05));
+  if (ctrl && key === 'ArrowDown') return run(() => nudgeVolume(-0.05));
+  if (ctrl || e.shiftKey) return;
+  if (key === 's') return run(() => $('shuffle').click());
+  if (key === 'r') return run(() => $('repeat').click());
+  if (key === 'l') return run(() => { if (!document.querySelector('.np-actions').hidden) $('like').click(); });
 });
+
+// ---- settings --------------------------------------------------------------------
+
+async function renderSettings() {
+  let current = await call('settings');
+  const save = async (patch, revert) => {
+    const next = { ...current, ...patch };
+    try {
+      await call('set_settings', { settings: next });
+      current = next;
+      toast('Saved');
+    } catch (e) {
+      revert();
+    }
+  };
+  const toggle = (key, title, desc) => {
+    const box = h('input', { type: 'checkbox', 'aria-label': title });
+    box.checked = !!current[key];
+    box.addEventListener('change', () => save({ [key]: box.checked }, () => { box.checked = !box.checked; }));
+    return h('label', { class: 'setting' },
+      h('div', { class: 'setting-text' }, h('div', { class: 'setting-title', text: title }), h('div', { class: 'setting-desc muted', text: desc })),
+      box);
+  };
+  const ytdlp = h('input', { type: 'text', spellcheck: 'false', 'aria-label': 'yt-dlp command' });
+  ytdlp.value = current.ytdlp;
+  ytdlp.addEventListener('change', () => save({ ytdlp: ytdlp.value.trim() }, () => { ytdlp.value = current.ytdlp; }));
+  ytdlp.addEventListener('keydown', (e) => { if (e.key === 'Enter') ytdlp.blur(); });
+  return [
+    h('h1', { text: 'Settings' }),
+    h('div', { class: 'settings' },
+      h('h2', { text: 'Playback' }),
+      toggle('high_quality', 'High quality audio', 'Best available stream (Opus, about 130–160 kbps). Off: the smallest stream, to save data.'),
+      toggle('normalize_volume', 'Normalize volume', 'Turn loud songs down so all songs play at about the same loudness.'),
+      toggle('autoplay_radio', 'Autoplay', 'When the queue runs out, keep playing similar songs. Not while repeat is on.'),
+      h('h2', { text: 'Window' }),
+      toggle('hide_on_close', 'Close to tray', 'The close button hides the window and the music keeps playing. Quit from the tray icon.'),
+      toggle('media_controls', 'Media keys and system controls', 'Show TubeDesk in the system\'s media controls (MPRIS). Takes effect after a restart.'),
+      h('h2', { text: 'Advanced' }),
+      h('div', { class: 'setting' },
+        h('div', { class: 'setting-text' }, h('div', { class: 'setting-title', text: 'yt-dlp command' }),
+          h('div', { class: 'setting-desc muted', text: 'Program used to look up audio streams: a name on your PATH or a full path.' })),
+        ytdlp),
+      h('h2', { text: 'Keyboard shortcuts' }),
+      h('div', { class: 'shortcuts' }, SHORTCUTS.flatMap(([keys, what]) => [
+        h('div', {}, keys.map((k) => h('kbd', { text: k }))),
+        h('div', { text: what }),
+      ])),
+    ),
+  ];
+}
 
 // ---- like / dislike / add to playlist ---------------------------------------------
 
@@ -708,6 +811,7 @@ function applyState(now) {
   // Always show what Play/Pause will do; loading is a ring around the button,
   // so the button stays usable (and its state honest) while a track starts.
   $('toggle').textContent = now.playing ? '⏸' : '▶';
+  applyModes(now);
   $('toggle').classList.toggle('busy', !!(now.loading || now.buffering) && !!now.track);
   const hold = state.seekHold;
   if (hold && (Date.now() > hold.until || Math.abs(now.position - hold.target) < 2)) state.seekHold = null;

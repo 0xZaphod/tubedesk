@@ -85,6 +85,7 @@ const view = $('view');
 
 function navigate(route) {
   state.current = route;
+  if (!$('nowplaying').hidden) setNowPlaying(false);
   for (const b of document.querySelectorAll('.nav')) {
     b.classList.toggle('active', b.dataset.view === route.name);
   }
@@ -566,7 +567,7 @@ $('toggle').addEventListener('click', () => call('control', { action: 'toggle' }
 $('next').addEventListener('click', () => call('control', { action: 'next' }));
 $('prev').addEventListener('click', () => call('control', { action: 'previous' }));
 const seek = $('seek');
-seek.addEventListener('input', () => { state.seeking = true; $('pos').textContent = fmt(seek.value); });
+seek.addEventListener('input', () => { state.seeking = true; $('pos').textContent = fmt(seek.value); drawSeek(); });
 seek.addEventListener('change', () => {
   state.seeking = false;
   // Hold the clicked position until the player reports it, so position
@@ -575,8 +576,143 @@ seek.addEventListener('change', () => {
   call('seek', { position: Number(seek.value) });
 });
 const vol = $('volume');
-vol.addEventListener('input', () => call('set_volume', { volume: Number(vol.value), persist: false }));
+vol.addEventListener('input', () => { showVolume(Number(vol.value)); call('set_volume', { volume: Number(vol.value), persist: false }); });
 vol.addEventListener('change', () => call('set_volume', { volume: Number(vol.value), persist: true }));
+
+// ---- volume button ------------------------------------------------------------------
+
+// The level before muting, restored by the next click.
+let unmutedVolume = null;
+function showVolume(v) {
+  vol.style.setProperty('--fill', `${Math.round(v * 100)}%`);
+  const level = v <= 0 ? 0 : v < 0.5 ? 1 : 2;
+  $('mute').dataset.level = String(level);
+  $('mute').title = v <= 0 ? 'Unmute (M)' : 'Mute (M)';
+}
+function setVolume(v) {
+  v = Math.min(1, Math.max(0, v));
+  vol.value = v;
+  showVolume(v);
+  call('set_volume', { volume: v, persist: true });
+}
+$('mute').addEventListener('click', () => {
+  const v = Number(vol.value);
+  if (v > 0) { unmutedVolume = v; setVolume(0); } else setVolume(unmutedVolume || 0.35);
+});
+
+// ---- seek bar ---------------------------------------------------------------------
+// Drawn on a canvas: the played part is a gently moving wave while music
+// plays and flattens when paused; the rest is a straight line.
+
+const seekCanvas = $('seek-canvas');
+const wave = { amp: 0, phase: 0, last: 0, raf: 0, tickAt: 0, colors: null };
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+function seekColors() {
+  const cs = getComputedStyle(document.documentElement);
+  return { accent: cs.getPropertyValue('--accent').trim(), track: cs.getPropertyValue('--track').trim() };
+}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { wave.colors = null; drawSeek(); });
+// The position to show: what the user drags, else the player's last report
+// moved on by the time since (reports come every 250 ms; this keeps it smooth).
+function seekPosition() {
+  const max = Number(seek.max) || 0;
+  if (state.seeking || state.seekHold || !state.now) return Number(seek.value);
+  let p = state.now.position;
+  if (state.now.playing && !state.now.loading && !state.now.buffering) p += (performance.now() - wave.tickAt) / 1000;
+  return Math.min(p, max);
+}
+function waving() {
+  const n = state.now;
+  return !!(n && n.track && n.playing && !n.loading && !n.buffering) && !document.hidden;
+}
+function drawSeek(t = performance.now()) {
+  wave.raf = 0;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(seekCanvas.clientWidth * dpr), h = Math.round(seekCanvas.clientHeight * dpr);
+  if (!w || !h) return;
+  if (seekCanvas.width !== w || seekCanvas.height !== h) { seekCanvas.width = w; seekCanvas.height = h; }
+  if (!wave.colors) wave.colors = seekColors();
+  const dt = wave.last ? Math.min(0.1, (t - wave.last) / 1000) : 0;
+  wave.last = t;
+  const target = waving() ? 3 * dpr : 0;
+  wave.amp += (target - wave.amp) * Math.min(1, dt * 8);
+  if (Math.abs(target - wave.amp) < 0.05) wave.amp = target;
+  // With "reduce motion" the wave still shows playback, but holds still.
+  if (!reducedMotion.matches) wave.phase = (wave.phase + dt * Math.PI * 2 * 0.9) % (Math.PI * 2);
+
+  const ctx = seekCanvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  const max = Number(seek.max) || 0;
+  const pad = 6 * dpr, mid = h / 2, line = 3 * dpr;
+  const x = pad + (w - 2 * pad) * (max > 0 ? Math.min(1, seekPosition() / max) : 0);
+  const gap = 5 * dpr;
+  ctx.lineWidth = line;
+  ctx.lineCap = 'round';
+  // Rest of the track.
+  if (x + gap < w - pad) {
+    ctx.strokeStyle = wave.colors.track;
+    ctx.beginPath(); ctx.moveTo(x + gap, mid); ctx.lineTo(w - pad, mid); ctx.stroke();
+  }
+  // Played part: the wave, easing into a flat line near both ends.
+  if (x - gap > pad) {
+    const len = 22 * dpr, end = x - gap;
+    ctx.strokeStyle = wave.colors.accent;
+    ctx.beginPath();
+    for (let px = pad; px <= end; px += dpr) {
+      const ease = Math.min(1, (px - pad) / len, (end - px) / len);
+      const y = mid + wave.amp * ease * Math.sin(((px - pad) / len) * Math.PI * 2 - wave.phase);
+      if (px === pad) ctx.moveTo(px, y); else ctx.lineTo(px, y);
+    }
+    ctx.stroke();
+  }
+  // Thumb: a short vertical bar.
+  const th = (seek.matches(':hover') || state.seeking ? 18 : 14) * dpr;
+  ctx.fillStyle = wave.colors.accent;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x - 2 * dpr, mid - th / 2, 4 * dpr, th, 2 * dpr);
+  else ctx.rect(x - 2 * dpr, mid - th / 2, 4 * dpr, th);
+  ctx.fill();
+  // Keep animating while it waves or is still settling.
+  if (wave.amp > 0 || target > 0) wave.raf = requestAnimationFrame(drawSeek);
+  else wave.last = 0;
+}
+function requestSeekDraw() {
+  if (!wave.raf) wave.raf = requestAnimationFrame(drawSeek);
+}
+document.addEventListener('visibilitychange', requestSeekDraw);
+new ResizeObserver(requestSeekDraw).observe(seekCanvas);
+seek.addEventListener('pointerenter', requestSeekDraw);
+seek.addEventListener('pointerleave', requestSeekDraw);
+
+// ---- now playing view ------------------------------------------------------------------
+
+// The largest cover; Google's image URLs can be asked for a bigger size.
+function bigThumb(list) {
+  if (!list || !list.length) return null;
+  const t = list.reduce((a, b) => (b.width > a.width ? b : a));
+  return /googleusercontent\.com/.test(t.url) ? t.url.replace(/=w\d+-h\d+/, '=w1200-h1200') : t.url;
+}
+function fillNowPlaying() {
+  const t = state.now && state.now.track;
+  const cover = t && bigThumb(t.cover);
+  for (const id of ['npv-cover', 'npv-backdrop']) {
+    if (cover) $(id).src = cover; else $(id).removeAttribute('src');
+  }
+  $('npv-title').textContent = t ? t.name : 'Nothing playing';
+  $('npv-artist').replaceChildren(...(t ? artistLinks(t.artists) : []));
+  const album = t && t.album;
+  $('npv-album').replaceChildren(album
+    ? (album.id ? h('span', { class: 'link', text: album.name, onclick: () => navigate({ name: 'album', id: album.id }) }) : album.name)
+    : '');
+}
+function setNowPlaying(open) {
+  if (open) fillNowPlaying();
+  $('nowplaying').hidden = !open;
+  $('np-open').setAttribute('aria-expanded', String(open));
+}
+$('np-open').addEventListener('click', () => setNowPlaying($('nowplaying').hidden));
+$('npv-close').addEventListener('click', () => setNowPlaying(false));
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('nowplaying').hidden) setNowPlaying(false); });
 $('queue-btn').addEventListener('click', () => setQueueVisible($('queue').hidden));
 $('queue-clear').addEventListener('click', () => call('queue_clear'));
 // ---- shuffle / repeat ------------------------------------------------------------
@@ -606,13 +742,13 @@ const SHORTCUTS = [
   [['S'], 'Shuffle on / off'],
   [['R'], 'Repeat: off → all → this song'],
   [['L'], 'Like the current song'],
+  [['M'], 'Mute / unmute'],
+  [['N'], 'Now playing view'],
   [['Ctrl', 'F'], 'Search (also /)'],
   [['Ctrl', ','], 'Settings'],
 ];
 function nudgeVolume(delta) {
-  const v = Math.min(1, Math.max(0, Number(vol.value) + delta));
-  vol.value = v;
-  call('set_volume', { volume: v, persist: true });
+  setVolume(Number(vol.value) + delta);
 }
 document.addEventListener('keydown', (e) => {
   const t = e.target;
@@ -636,6 +772,8 @@ document.addEventListener('keydown', (e) => {
   if (key === 's') return run(() => $('shuffle').click());
   if (key === 'r') return run(() => $('repeat').click());
   // Only likes (unliking stays a click), matching the shortcut list.
+  if (key === 'm') return run(() => $('mute').click());
+  if (key === 'n') return run(() => setNowPlaying($('nowplaying').hidden));
   if (key === 'l') return run(() => { if (!document.querySelector('.np-actions').hidden && rating.value !== 'like') $('like').click(); });
 });
 
@@ -831,11 +969,14 @@ function applyState(now) {
     $('pos').textContent = fmt(now.position);
   }
   $('dur').textContent = fmt(now.duration);
-  if (document.activeElement !== vol) vol.value = now.volume;
+  if (document.activeElement !== vol) { vol.value = now.volume; showVolume(now.volume); }
+  wave.tickAt = performance.now();
+  requestSeekDraw();
   if (now.error && now.error !== lastError) toast(`Playback failed: ${now.error}`, { error: true });
   lastError = now.error;
   const id = t && t.id;
   if (id !== prevId) {
+    if (!$('nowplaying').hidden) fillNowPlaying();
     $('np-title').textContent = t ? t.name : 'Nothing playing';
     $('np-artist').replaceChildren(...(t ? artistLinks(t.artists) : []));
     const cover = t && thumb(t.cover);

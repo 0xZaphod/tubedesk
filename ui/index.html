@@ -48,6 +48,21 @@
         </form>
       </header>
       <section id="view"></section>
+      <!-- Now playing: large cover over the main area (click the cover in the player bar). -->
+      <section id="nowplaying" hidden aria-label="Now playing">
+        <img id="npv-backdrop" alt="" aria-hidden="true">
+        <button id="npv-close" class="icon" title="Close (Esc)" aria-label="Close now playing">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="npv-body">
+          <img id="npv-cover" alt="">
+          <div class="npv-text">
+            <h1 id="npv-title" class="ellipsis"></h1>
+            <div id="npv-artist" class="ellipsis"></div>
+            <div id="npv-album" class="ellipsis muted"></div>
+          </div>
+        </div>
+      </section>
     </main>
 
     <aside id="queue" hidden>
@@ -60,7 +75,7 @@
 
     <footer id="playerbar">
       <div class="np">
-        <img id="np-cover" alt="">
+        <button id="np-open" class="np-open" title="Now playing" aria-label="Show now playing"><img id="np-cover" alt=""></button>
         <div class="np-text">
           <div id="np-title" class="ellipsis">Nothing playing</div>
           <div id="np-artist" class="ellipsis muted"></div>
@@ -88,7 +103,10 @@
         </div>
         <div class="seek">
           <span id="pos" class="time">0:00</span>
-          <input id="seek" type="range" min="0" max="0" step="1" value="0" aria-label="Seek">
+          <div class="seekbar">
+            <canvas id="seek-canvas" aria-hidden="true"></canvas>
+            <input id="seek" type="range" min="0" max="0" step="1" value="0" aria-label="Seek">
+          </div>
           <span id="dur" class="time">0:00</span>
         </div>
       </div>
@@ -107,6 +125,9 @@
             <div id="playlist-menu" class="menu" role="menu" hidden></div>
           </div>
         </div>
+        <button id="mute" class="icon small" title="Mute (M)" aria-label="Mute">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path class="vol-body" d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path class="vol-wave1" d="M15.5 9.5a3.5 3.5 0 0 1 0 5"/><path class="vol-wave2" d="M18 7a7 7 0 0 1 0 10"/><path class="vol-off" d="M16 9.5l5 5M21 9.5l-5 5"/></svg>
+        </button>
         <input id="volume" type="range" min="0" max="1" step="0.01" aria-label="Volume">
         <button id="queue-btn" class="icon small" title="Queue" aria-label="Show queue" aria-pressed="false" aria-controls="queue">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h13M3 11h13M3 16h7M15 14.5v6l5-3z"/></svg>
